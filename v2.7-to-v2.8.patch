@@ -1,0 +1,188 @@
+--- /mnt/data/wmr-universal-dashboard-v2.7/index.php	2026-08-09 09:24:30.897651957 +0000
++++ /mnt/data/wmr-universal-dashboard-v2.8/index.php	2026-08-09 09:25:36.396537945 +0000
+@@ -1,6 +1,6 @@
+ <?php
+ /**
+- * Oregon Scientific WMR Universal Developer Trace Dashboard v2.7
++ * Oregon Scientific WMR Universal Developer Trace Dashboard v2.8
+  *
+  * Standalone diagnostics dashboard for the hardened WeeWX drivers:
+  *   - WMR100 protocol family: WMR100/WMR100N, WMR88/WMR88A, WMR180/A, WMRS200
+@@ -33,11 +33,11 @@
+ const DEFAULT_DISPLAY_LIMIT = 250;
+ const MAX_DISPLAY_LIMIT = 2000;
+ const LOCAL_TIMEZONE = 'Europe/Rome';
+-const PAGE_TITLE = 'Oregon Scientific WMR Developer Trace v2.7';
++const PAGE_TITLE = 'Oregon Scientific WMR Developer Trace v2.8';
+ const RECENT_HEALTH_WINDOW = 600;
+ const DEFAULT_LIVE_REFRESH = 5;
+ const API_TAIL_LINES = 6000; // retained only for detection/backward compatibility
+-const LIVE_CACHE_VERSION = 4;
++const LIVE_CACHE_VERSION = 5;
+ const LIVE_CACHE_ROOT = '/tmp';
+ const DETECTION_TAIL_LINES = 8000;
+ const DIAGNOSTIC_TAIL_LINES = 5000;
+@@ -706,26 +706,71 @@
+     return '<svg class="forecast-svg forecast-'.$kind.'" viewBox="0 0 60 60" role="img" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">'.$body.'</svg>';
+ }
+ 
+-function decode_wmr100_forecast(?string $rawHex): ?int
++function decode_wmr100_pressure_metadata(?string $rawHex): ?array
+ {
+     $bytes = parse_hex_bytes($rawHex);
+-    // Pressure packet: status, 0x46, pressure low, forecast/high-pressure byte,
+-    // relative-pressure low, previous/unknown nibble byte, checksum lo/hi.
++    // WMR100/WMR88 pressure packet (0x46):
++    //   [0] status
++    //   [1] 0x46
++    //   [2] station pressure low byte
++    //   [3] forecast code (high nibble) + station pressure high nibble
++    //   [4] console relative/SLP pressure low byte
++    //   [5] previous forecast code (high nibble) + relative pressure high nibble
++    //   [6..7] checksum
++    //
++    // These values are transmitted by the console. In particular, the
++    // forecast code is NOT calculated by this dashboard.
+     if(count($bytes)!==8 || ($bytes[1]??null)!==0x46) return null;
+-    return (($bytes[3] >> 4) & 0x0F);
++    return [
++        'station_pressure' => (float)(((($bytes[3] & 0x0F) << 8) + $bytes[2])),
++        'console_barometer' => (float)(((($bytes[5] & 0x0F) << 8) + $bytes[4])),
++        'forecast_code' => (($bytes[3] >> 4) & 0x0F),
++        'previous_forecast_code' => (($bytes[5] >> 4) & 0x0F),
++    ];
+ }
+ 
+-function store_wmr100_forecast_from_pressure(array &$a, array $data, ?string $timestamp, ?float $epoch): void
++function decode_wmr100_forecast(?string $rawHex): ?int
+ {
+-    $code = decode_wmr100_forecast((string)($data['raw_hex']??''));
+-    if($code===null) return;
++    $meta = decode_wmr100_pressure_metadata($rawHex);
++    return $meta===null ? null : (int)$meta['forecast_code'];
++}
++
++function store_wmr100_pressure_metadata(array &$a, array $data, ?string $timestamp, ?float $epoch): void
++{
++    $meta = decode_wmr100_pressure_metadata((string)($data['raw_hex']??''));
++    if($meta===null) return;
++
++    // gp6 exposes forecastIcon directly in loop_packet. Keep this raw-packet
++    // fallback for gp5 and older traces; when a gp6 loop_packet follows, the
++    // driver-provided value naturally replaces this entry.
+     $a['weather_latest']['forecastIcon'] = [
+-        'value'=>$code,
++        'value'=>(int)$meta['forecast_code'],
+         'timestamp'=>$timestamp,
+         'epoch'=>$epoch,
+         'packet'=>'pressure',
+         'usUnits'=>null,
+         'native_field'=>'forecast_code',
++        'source'=>'pressure_packet_raw_fallback',
++    ];
++
++    // The second pressure value is transmitted by the console and is useful
++    // diagnostically, but it is NOT WeeWX altimeter. Keep a distinct name.
++    $a['weather_latest']['consoleBarometer'] = [
++        'value'=>(float)$meta['console_barometer'],
++        'timestamp'=>$timestamp,
++        'epoch'=>$epoch,
++        'packet'=>'pressure',
++        'usUnits'=>1,
++        'native_field'=>'console_barometer',
++        'source'=>'pressure_packet_raw',
++    ];
++    $a['weather_latest']['previousForecastCode'] = [
++        'value'=>(int)$meta['previous_forecast_code'],
++        'timestamp'=>$timestamp,
++        'epoch'=>$epoch,
++        'packet'=>'pressure',
++        'usUnits'=>null,
++        'native_field'=>'previous_forecast_code',
+         'source'=>'pressure_packet_raw',
+     ];
+ }
+@@ -735,7 +780,7 @@
+     if($value===null||$value==='')return 'N/A'; $n=is_numeric($value)?(float)$value:null; if($n===null)return (string)$value;
+     if(preg_match('/Temp|temperature|dewpoint|windchill|heatindex/i',$key))return number_format($n,1,',','.').' °C';
+     if(preg_match('/Humidity|humidity/i',$key))return number_format($n,0,',','.').' %';
+-    if(in_array($key,['pressure','barometer','altimeter'],true))return number_format($n,1,',','.').' hPa';
++    if(in_array($key,['pressure','barometer','altimeter','consoleBarometer'],true))return number_format($n,1,',','.').' hPa';
+     if(in_array($key,['windSpeed','windGust'],true)){
+         if($family==='wmr200')return number_format($n,1,',','.').' km/h ('.number_format($n/3.6,1,',','.').' m/s)';
+         return number_format($n,1,',','.').' m/s ('.number_format($n*3.6,1,',','.').' km/h)';
+@@ -851,7 +896,11 @@
+     foreach($record as $field=>$value){
+         if(in_array($field,['dateTime','usUnits','interval','rain_total_last'],true)||$value===null)continue;
+         $common=$family==='wmr200'?common_field_from_wmr200((string)$field):(string)$field;
+-        $a['weather_latest'][$common]=['value'=>$value,'timestamp'=>$timestamp,'epoch'=>$epoch,'packet'=>$packetName,'usUnits'=>$record['usUnits']??null,'native_field'=>$field];
++        $a['weather_latest'][$common]=[
++            'value'=>$value,'timestamp'=>$timestamp,'epoch'=>$epoch,'packet'=>$packetName,
++            'usUnits'=>$record['usUnits']??null,'native_field'=>$field,
++            'source'=>$family==='wmr100'?'driver_loop':'driver_decoded',
++        ];
+         if(is_numeric($value)){
+             if(!isset($a['weather_history'][$common]))$a['weather_history'][$common]=[];
+             append_limited($a['weather_history'][$common],(float)$value,SPARKLINE_POINTS);
+@@ -990,7 +1039,7 @@
+         case 'sensor_value_suspicious':case 'sensor_channel_outside_model_profile':case 'wind_gust_inconsistent':case 'clock_packet_invalid':$a['summary']['sensor_warnings']++;break;
+         case 'packet_valid':
+             $a['summary']['packet_valid']++;$packet=normalize_packet_name('wmr100',(string)($data['packet_name']??'unknown'));$a['packet_counts'][$packet]=($a['packet_counts'][$packet]??0)+1;update_packet_timing($a,$packet,$epoch);
+-            if($packet==='pressure') store_wmr100_forecast_from_pressure($a,$data,$timestamp,$epoch);
++            if($packet==='pressure') store_wmr100_pressure_metadata($a,$data,$timestamp,$epoch);
+             if(($a['parser']['state']??'unknown')==='unknown')$a['parser']['state']='synced';if($epoch!==null){$a['last_rx_timestamp']=$timestamp;$a['last_rx_epoch']=$epoch;$a['current_timeout_consecutive']=0;}break;
+         case 'loop_packet':
+             $a['summary']['loop_packets']++;$packet=normalize_packet_name('wmr100',(string)($data['packet_name']??'unknown'));$fields=isset($data['fields'])&&is_array($data['fields'])?$data['fields']:[];store_weather_record($a,$fields,$packet,$timestamp,$epoch);if($epoch!==null){$a['last_rx_timestamp']=$timestamp;$a['last_rx_epoch']=$epoch;$a['current_timeout_consecutive']=0;}break;
+@@ -1248,11 +1297,14 @@
+     <?php return(string)ob_get_clean();
+ }
+ 
+-function weather_groups(): array
++function weather_groups(string $family='wmr100'): array
+ {
++    $pressureFields = $family==='wmr200'
++        ? ['pressure'=>'Pressione stazione','altimeter'=>'Altimetro','forecastIcon'=>'Previsione console']
++        : ['pressure'=>'Pressione stazione / assoluta','consoleBarometer'=>'Pressione relativa console / SLP','forecastIcon'=>'Previsione console'];
+     return [
+       'temperature_humidity'=>['title'=>'Temperature e umidità','fields'=>['outTemp'=>'Temperatura esterna','outHumidity'=>'Umidità esterna','heatindex'=>'Heat index esterno','inTemp'=>'Temperatura interna','inHumidity'=>'Umidità interna']],
+-      'pressure'=>['title'=>'Pressione','fields'=>['pressure'=>'Pressione stazione','altimeter'=>'Altimetro console','forecastIcon'=>'Previsione console']],
++      'pressure'=>['title'=>'Pressione','fields'=>$pressureFields],
+       'wind'=>['title'=>'Vento','fields'=>['windSpeed'=>'Velocità','windGust'=>'Raffica','windDir'=>'Direzione','windchill'=>'Wind chill']],
+       'rain'=>['title'=>'Pioggia','fields'=>['rainRate'=>'Intensità','hourRain'=>'Ultima ora','rain24'=>'Ultime 24 ore','rainTotal'=>'Totale console','rain'=>'Incremento']],
+       'uv'=>['title'=>'Radiazione UV','fields'=>['UV'=>'Indice UV']],
+@@ -1261,14 +1313,24 @@
+ 
+ function render_weather(array $a): string
+ {
+-    ob_start();foreach(weather_groups() as $packet=>$group){$t=$a['packet_timing'][$packet]??null;$avg=$t['average_interval']??null;$age=$t['age']??null;[$cls,$label]=packet_freshness($packet,$age,$avg,$a['family'],(string)($a['meta']['model']??''));$sparkField=['temperature_humidity'=>'outTemp','pressure'=>'pressure','wind'=>'windSpeed','rain'=>'rainRate','uv'=>'UV'][$packet]??'';$spark=$sparkField?sparkline_svg($a['weather_history'][$sparkField]??[]):'';?>
++    ob_start();foreach(weather_groups($a['family']) as $packet=>$group){$t=$a['packet_timing'][$packet]??null;$avg=$t['average_interval']??null;$age=$t['age']??null;[$cls,$label]=packet_freshness($packet,$age,$avg,$a['family'],(string)($a['meta']['model']??''));$sparkField=['temperature_humidity'=>'outTemp','pressure'=>'pressure','wind'=>'windSpeed','rain'=>'rainRate','uv'=>'UV'][$packet]??'';$spark=$sparkField?sparkline_svg($a['weather_history'][$sparkField]??[]):'';?>
+     <article class="weather-card <?=h($cls)?>"><div class="weather-head"><h3><?=h($group['title'])?></h3><div class="weather-head-right"><?=$spark?><span class="freshness <?=h($cls)?>"><?=h($label)?></span></div></div><div class="metrics">
+     <?php foreach($group['fields'] as $field=>$flabel):$r=reading($a,$field);?>
+       <?php if($field==='forecastIcon'):?>
+         <?php if($r):$fc=(int)$r['value'];$fi=forecast_info($fc,$a['family']);?>
+         <div class="forecast-metric">
+           <div class="forecast-icon-wrap"><?=forecast_icon_svg($fc,$a['family'])?></div>
+-          <div class="forecast-copy"><span class="metric-name"><?=h($flabel)?></span><strong><?=h($fi['label'])?></strong><span class="forecast-code">Codice console <?=h((string)$fc)?></span><span class="metric-age">letto <?=h(format_age(reading_age($r)))?> · <?=h(local_timestamp($r['timestamp'],false))?></span></div>
++          <?php
++            $forecastSource=(string)($r['source']??'');
++            if($a['family']==='wmr100'){
++                $forecastSourceLabel=$forecastSource==='driver_loop'
++                    ? 'forecastIcon fornito direttamente dal driver (codice nativo console)'
++                    : 'fallback compatibilità: codice nativo estratto dal pacchetto pressione 0x46';
++            }else{
++                $forecastSourceLabel='forecastIcon fornito dal driver WMR200';
++            }
++          ?>
++          <div class="forecast-copy"><span class="metric-name"><?=h($flabel)?></span><strong><?=h($fi['label'])?></strong><span class="forecast-code">Codice console <?=h((string)$fc)?></span><span class="metric-age">letto <?=h(format_age(reading_age($r)))?> · <?=h(local_timestamp($r['timestamp'],false))?></span><span class="metric-age"><?=h($forecastSourceLabel)?></span></div>
+         </div>
+         <?php else:?>
+         <div class="metric"><span class="metric-name"><?=h($flabel)?></span><span class="metric-value">N/A</span></div>
+@@ -1277,7 +1339,7 @@
+         <div class="metric"><span class="metric-name"><?=h($flabel)?></span><span class="metric-value"><?=h($r?weather_value($field,$r['value'],$a['family']):'N/A')?></span><?php if($r):?><span class="metric-age">letto <?=h(format_age(reading_age($r)))?> · <?=h(local_timestamp($r['timestamp'],false))?></span><?php endif;?></div>
+       <?php endif;?>
+     <?php endforeach;?></div>
+-    <div class="weather-foot">Età pacchetto: <?=h(format_age($age))?> · ultimo intervallo <?=h(format_interval($t['last_interval']??null))?> · media <?=h(format_interval($avg))?><br>Ricezioni sessione: <?=number_format((int)($t['count']??0),0,',','.')?> · atteso ~<?=(int)packet_expected_interval($packet,$a['family'],(string)($a['meta']['model']??''))?> s<?php if($packet==='pressure'&&$a['family']==='wmr100'):?><br><span class="forecast-note">Previsione letta direttamente dal pacchetto pressione 0x46 della console.</span><?php endif;?></div></article><?php }return(string)ob_get_clean();
++    <div class="weather-foot">Età pacchetto: <?=h(format_age($age))?> · ultimo intervallo <?=h(format_interval($t['last_interval']??null))?> · media <?=h(format_interval($avg))?><br>Ricezioni sessione: <?=number_format((int)($t['count']??0),0,',','.')?> · atteso ~<?=(int)packet_expected_interval($packet,$a['family'],(string)($a['meta']['model']??''))?> s<?php if($packet==='pressure'&&$a['family']==='wmr100'):?><br><span class="forecast-note">La pressione relativa/SLP e il codice previsione sono trasmessi dalla console. <code>altimeter</code> resta un valore distinto calcolabile da WeeWX.</span><?php endif;?></div></article><?php }return(string)ob_get_clean();
+ }
+ 
+ function sensor_channel_definition(int $ch): array

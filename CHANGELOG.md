@@ -1,28 +1,31 @@
 # Changelog
 
-## v2.6 — Console forecast code and icon
+## v2.7 - 2026-08-09
 
-- Added console forecast icon and Italian forecast description to the Pressure card.
-- Added WMR100/WMR88/WMR88A forecast extraction directly from valid `0x46` pressure packets.
-- Added original console forecast code display alongside the icon.
-- Added WMR200 forecast rendering using the existing `forecastIcon` field.
-- Added family-aware forecast maps, including WMR200 night forecast codes.
-- Added standalone inline SVG weather icons with no external dependencies.
-- Bumped live-cache schema to invalidate pre-v2.6 cached weather state.
+### Fixed
+- Fixed missing WMR100/WMR88/WMR88A driver version and model after JSONL trace rotation.
+- The dashboard now harvests `driver`, `driver_version` and `model` from every trace event instead of depending only on `driver_start`.
+- WMR100 startup-only metadata (VID, PID, USB endpoint, model profile, timeout thresholds and channel count) is recovered from the active trace or its rotated backups without adding backup events to live counters.
+- Fixed missing WMR100/WMR88 session uptime when `driver_start` is no longer present in the active JSONL.
+- Improved the `USB / profilo` field to show VID:PID, model profile and endpoint when available.
+- Bumped the live-cache schema to force regeneration of stale v2.6 metadata.
 
-## v2.5 — Persistent manual trace selection
+### Unchanged
+- WMR200 parsing and live-monitor behaviour are unchanged.
+- Rotated trace records are not included in event counters unless `Backup ruotati` is explicitly enabled.
 
-- Fixed manual trace mode persistence across browser refresh (`F5`).
-- The selected source mode is now remembered immediately when the Auto/Manual switch changes; pressing **Applica** is not required just to persist the mode.
-- The manual trace path is remembered across refreshes and browser reopenings.
-- The selected parser/family (`Auto`, `WMR100/WMR88`, `WMR200`) is remembered as well.
-- Explicitly selecting **Automatico** overwrites the stored manual mode.
-- **Azzera filtri** now clears display/search parameters without silently discarding the selected trace source.
-- Source preferences are stored in same-origin `SameSite=Lax` cookies for one year; no credentials or trace contents are stored.
-- Retains all v2.4 fixes: incremental AJAX state for WMR200, JSONL partial-line handling, trace rotation handling, and RF channel panel only for WMR100/WMR88 family.
+## v2.8 - 2026-08-09
 
-## v2.4
+### Changed
+- Added native support for WMR100/WMR88 driver `forecastIcon` introduced by driver 3.5.6-gp6.
+- Preserved automatic forecast-code fallback from raw pressure packet `0x46` for gp5 and older traces.
+- Replaced the misleading WMR100/WMR88 label `Altimetro console` with `Pressione relativa console / SLP`.
+- WMR100/WMR88 console relative pressure is now decoded directly from the native `0x46` pressure packet for diagnostics.
+- WMR200 continues to display its driver-provided `altimeter` value unchanged.
+- Added an explicit indication of forecast source: gp6 driver LOOP, raw 0x46 compatibility fallback, or WMR200 driver.
+- Incremented the live-cache schema to version 5 to prevent stale v2.7 metadata/weather state.
 
-- Incremental AJAX live state for WMR200.
-- Correct handling of trace rotation/truncation and partial JSONL writes.
-- RF/channel panel hidden for WMR200/WMR200A and retained for WMR100/WMR88 family.
+### Compatibility
+- WMR100/WMR88/WMR88A gp6: uses driver-provided `forecastIcon`.
+- WMR100/WMR88/WMR88A gp5 and earlier hardened traces: uses verified raw `0x46` fallback.
+- WMR200/WMR200A: unchanged pressure/altimeter/forecast behavior.
