@@ -1,6 +1,6 @@
 <?php
 /**
- * Oregon Scientific WMR Universal Developer Trace Dashboard v2.6
+ * Oregon Scientific WMR Universal Developer Trace Dashboard v2.7
  *
  * Standalone diagnostics dashboard for the hardened WeeWX drivers:
  *   - WMR100 protocol family: WMR100/WMR100N, WMR88/WMR88A, WMR180/A, WMRS200
@@ -33,11 +33,11 @@ const MAX_RECORDS_SCANNED = 250000;
 const DEFAULT_DISPLAY_LIMIT = 250;
 const MAX_DISPLAY_LIMIT = 2000;
 const LOCAL_TIMEZONE = 'Europe/Rome';
-const PAGE_TITLE = 'Oregon Scientific WMR Developer Trace v2.6';
+const PAGE_TITLE = 'Oregon Scientific WMR Developer Trace v2.7';
 const RECENT_HEALTH_WINDOW = 600;
 const DEFAULT_LIVE_REFRESH = 5;
 const API_TAIL_LINES = 6000; // retained only for detection/backward compatibility
-const LIVE_CACHE_VERSION = 3;
+const LIVE_CACHE_VERSION = 4;
 const LIVE_CACHE_ROOT = '/tmp';
 const DETECTION_TAIL_LINES = 8000;
 const DIAGNOSTIC_TAIL_LINES = 5000;
@@ -286,6 +286,19 @@ function probe_trace_file(string $path, string $familyHint): ?array
             if ($d === 'WMR100') { $family = 'wmr100'; $score100 += 20; }
             $driver = $d;
         }
+
+        // Hardened WMR100/WMR88 traces repeat driver_version and model on
+        // every JSONL event. Do not depend on driver_start still being in the
+        // active file after log rotation.
+        if (($version === null || $version === '') && isset($row['driver_version'])) {
+            $version = (string)$row['driver_version'];
+        } elseif (($version === null || $version === '') && isset($row['version'])) {
+            $version = (string)$row['version'];
+        }
+        if (($model === null || $model === '') && isset($row['model'])) {
+            $model = (string)$row['model'];
+        }
+
         if (($row['event'] ?? '') === 'driver_start') {
             $driver = (string)($row['driver'] ?? ($family === 'wmr200' ? 'WMR200' : 'WMR100'));
             $version = (string)($row['driver_version'] ?? $row['version'] ?? '');
@@ -311,6 +324,55 @@ function probe_trace_file(string $path, string $familyHint): ?array
         'latest_epoch'=>$latestEpoch, 'driver'=>$driver, 'version'=>$version,
         'model'=>$model, 'size'=>(int)@filesize($path), 'mtime'=>(int)@filemtime($path),
     ];
+}
+
+
+function find_latest_driver_start_context(string $traceFile): ?array
+{
+    // Metadata such as VID/PID, endpoint, profile and timeout thresholds is
+    // emitted by WMR100/WMR88 primarily in driver_start. The active JSONL can
+    // be a rotated continuation that no longer contains that event. Search the
+    // active file first, then the configured backups, without adding those
+    // backup records to counters/statistics.
+    $candidates = [$traceFile];
+    for ($i = 1; $i <= TRACE_BACKUPS; $i++) {
+        $candidates[] = $traceFile . '.' . $i;
+    }
+
+    foreach ($candidates as $candidate) {
+        if (!is_file($candidate) || !is_readable($candidate)) continue;
+        $lines = tail_lines($candidate, 50000);
+        for ($i = count($lines) - 1; $i >= 0; $i--) {
+            $row = json_decode(trim($lines[$i]), true);
+            if (!is_array($row) || ($row['event'] ?? '') !== 'driver_start') continue;
+            $row['_context_file'] = $candidate;
+            return $row;
+        }
+    }
+    return null;
+}
+
+function enrich_source_with_start_context(array $source): array
+{
+    $path = (string)($source['path'] ?? '');
+    if ($path === '') return $source;
+
+    $context = find_latest_driver_start_context($path);
+    if ($context === null) return $source;
+
+    $source['startup_context'] = $context;
+    $source['startup_timestamp'] = isset($context['timestamp_utc']) ? (string)$context['timestamp_utc'] : null;
+
+    if ((!isset($source['driver']) || !$source['driver']) && isset($context['driver'])) {
+        $source['driver'] = (string)$context['driver'];
+    }
+    if ((!isset($source['version']) || !$source['version'])) {
+        $source['version'] = (string)($context['driver_version'] ?? $context['version'] ?? '');
+    }
+    if ((!isset($source['model']) || !$source['model']) && isset($context['model'])) {
+        $source['model'] = (string)$context['model'];
+    }
+    return $source;
 }
 
 function detect_trace_source(string $requested = 'auto', string $traceMode = 'auto', string $manualTrace = ''): array
@@ -707,21 +769,47 @@ function sparkline_svg(array $values): string
 // -----------------------------------------------------------------------------
 function new_analysis_state(array $source): array
 {
+    $ctx = isset($source['startup_context']) && is_array($source['startup_context'])
+        ? $source['startup_context'] : [];
+
+    $meta = [
+        'family'=>$source['family'],
+        'driver'=>$source['driver'] ?? ($source['family']==='wmr200'?'WMR200':'WMR100'),
+        'driver_version'=>$source['version']?:'sconosciuta',
+        'model'=>$source['model']?:family_title($source['family']),
+        'model_profile'=>$source['family']==='wmr200'?'wmr200':'',
+        'max_remote_channels'=>$source['family']==='wmr200'?0:3,
+        'timeout_warning_threshold'=>$source['family']==='wmr200'?2:8,
+        'timeout_error_threshold'=>$source['family']==='wmr200'?4:20,
+        'timeout_reinit_threshold'=>$source['family']==='wmr200'?0:12,
+        'timeout_recovery_threshold'=>$source['family']==='wmr200'?0:20,
+        'driver_start_timestamp'=>$source['startup_timestamp'] ?? null,
+    ];
+
+    // Recover WMR100/WMR88 startup-only fields from the active/rotated trace
+    // context without counting backup records as live events.
+    foreach ([
+        'driver','driver_version','version','model','model_profile','vendor_id',
+        'product_id','interface','in_endpoint','send_data_request',
+        'max_remote_channels','timeout_seconds','timeout_warning_threshold',
+        'timeout_reinit_threshold','timeout_recovery_threshold',
+        'timeout_error_threshold','archive_interval','erase_archive'
+    ] as $key) {
+        if (!array_key_exists($key, $ctx) || $ctx[$key] === null || $ctx[$key] === '') continue;
+        if ($key === 'version' && !isset($ctx['driver_version'])) {
+            $meta['driver_version'] = $ctx[$key];
+        } elseif ($key !== 'version') {
+            $meta[$key] = $ctx[$key];
+        }
+    }
+
     return [
         'family'=>$source['family'],'source'=>$source,
         'records'=>0,'invalid_json'=>0,'bytes'=>0,'scan_stopped'=>false,
         'severity'=>['critical'=>0,'error'=>0,'warning'=>0,'info'=>0],
         'historical_issues'=>0,'recent_issues'=>0,'event_counts'=>[],'packet_counts'=>[],'versions'=>[],
         'first_timestamp'=>null,'last_timestamp'=>null,'last_event_epoch'=>null,'last_rx_timestamp'=>null,'last_rx_epoch'=>null,
-        'meta'=>[
-            'family'=>$source['family'],'driver'=>$source['family']==='wmr200'?'WMR200':'WMR100',
-            'driver_version'=>$source['version']?:'sconosciuta','model'=>$source['model']?:family_title($source['family']),
-            'model_profile'=>'','max_remote_channels'=>$source['family']==='wmr200'?0:3,
-            'timeout_warning_threshold'=>$source['family']==='wmr200'?2:8,
-            'timeout_error_threshold'=>$source['family']==='wmr200'?4:20,
-            'timeout_reinit_threshold'=>$source['family']==='wmr200'?0:12,
-            'timeout_recovery_threshold'=>$source['family']==='wmr200'?0:20,
-        ],
+        'meta'=>$meta,
         'current_health_state'=>'starting','current_timeout_consecutive'=>0,
         'summary'=>[
             'timeouts'=>0,'max_consecutive_timeouts'=>0,'timeout_episodes'=>0,'timeout_recoveries'=>0,
@@ -771,6 +859,41 @@ function store_weather_record(array &$a, array $record, string $packetName, ?str
     }
 }
 
+
+function refresh_common_metadata(array &$a, array $data): void
+{
+    // The hardened WMR100/WMR88 driver repeats driver, driver_version, model,
+    // thread and health_state on every trace record. Harvest those common
+    // fields continuously so metadata remains available even after rotation.
+    if (isset($data['driver']) && (string)$data['driver'] !== '') {
+        $a['meta']['driver'] = (string)$data['driver'];
+    }
+    if (isset($data['driver_version']) && (string)$data['driver_version'] !== '') {
+        $a['meta']['driver_version'] = (string)$data['driver_version'];
+    } elseif (isset($data['version']) && (string)$data['version'] !== '' &&
+              (($a['meta']['driver_version'] ?? '') === '' || ($a['meta']['driver_version'] ?? '') === 'sconosciuta')) {
+        $a['meta']['driver_version'] = (string)$data['version'];
+    }
+    if (isset($data['model']) && (string)$data['model'] !== '') {
+        $a['meta']['model'] = (string)$data['model'];
+    }
+
+    // These fields are usually present only in driver_start, but accepting
+    // them from any event keeps the monitor forward-compatible.
+    $direct = [
+        'model_profile', 'vendor_id', 'product_id', 'interface', 'in_endpoint',
+        'send_data_request', 'max_remote_channels', 'timeout_seconds',
+        'timeout_warning_threshold', 'timeout_reinit_threshold',
+        'timeout_recovery_threshold', 'timeout_error_threshold',
+        'archive_interval', 'erase_archive',
+    ];
+    foreach ($direct as $key) {
+        if (array_key_exists($key, $data) && $data[$key] !== null && $data[$key] !== '') {
+            $a['meta'][$key] = $data[$key];
+        }
+    }
+}
+
 function start_session(array &$a, array $data, ?string $timestamp): void
 {
     $family=$a['family'];
@@ -801,6 +924,7 @@ function process_trace_record(array &$a, array $data, string $rawLine, array $op
 {
     $a['records']++;$family=$a['family'];$event=(string)($data['event']??'unknown');
     $timestamp=isset($data['timestamp_utc'])?(string)$data['timestamp_utc']:null;$epoch=timestamp_epoch($timestamp);
+    refresh_common_metadata($a,$data);
     if($event==='driver_start')start_session($a,$data,$timestamp);
     $severity=event_severity($data,$a['meta'],$family);$a['severity'][$severity]++;$a['event_counts'][$event]=($a['event_counts'][$event]??0)+1;
     if($timestamp!==null){if($a['first_timestamp']===null)$a['first_timestamp']=$timestamp;$a['last_timestamp']=$timestamp;$a['last_event_epoch']=$epoch;}
@@ -1064,9 +1188,29 @@ function reading_age(?array $r): ?float{return $r&&isset($r['epoch'])&&$r['epoch
 
 function render_console_strip(array $a): string
 {
-    $m=$a['meta'];$session=$a['sessions'][0]??null;$uptime=$session?format_duration((float)($session['duration']??0)):'N/D';
+    $m=$a['meta'];$session=$a['sessions'][0]??null;
+    if($session){
+        $uptime=format_duration((float)($session['duration']??0));
+    }elseif(!empty($m['driver_start_timestamp'])){
+        $start=timestamp_epoch((string)$m['driver_start_timestamp']);
+        $uptime=$start!==null?format_duration(max(0,microtime(true)-$start)):'N/D';
+    }elseif($a['first_timestamp']!==null){
+        $start=timestamp_epoch((string)$a['first_timestamp']);
+        $uptime=$start!==null?'≥ '.format_duration(max(0,microtime(true)-$start)):'N/D';
+    }else{
+        $uptime='N/D';
+    }
     $parser=strtoupper((string)($a['parser']['state']??'unknown'));$parserClass=in_array($parser,['SYNCED','HEALTHY'],true)?'ok':($parser==='RESYNC'?'warning':'info');
-    $usb=$a['family']==='wmr100'?(($m['vendor_id']??'?').':'.($m['product_id']??'?')):'WMR200 HID';
+    if($a['family']==='wmr100'){
+        $vid=(string)($m['vendor_id']??'?');$pid=(string)($m['product_id']??'?');
+        $profile=(string)($m['model_profile']??'');
+        $endpoint=(string)($m['in_endpoint']??'');
+        $usb=$vid.':'.$pid;
+        if($profile!=='')$usb.=' · '.$profile;
+        if($endpoint!=='')$usb.=' · EP '.$endpoint;
+    }else{
+        $usb='WMR200 HID';
+    }
     ob_start();?>
     <div class="console-strip">
       <div><span>Console</span><strong><?=h($m['model']??'N/D')?></strong></div>
@@ -1234,7 +1378,9 @@ if($stationExplicit)set_source_pref_cookie(SOURCE_PREF_COOKIE_STATION,$stationMo
 if($traceModeExplicit)set_source_pref_cookie(SOURCE_PREF_COOKIE_TRACE_MODE,$traceMode);
 if($traceFileExplicit&&$manualTraceInput!=='')set_source_pref_cookie(SOURCE_PREF_COOKIE_TRACE_FILE,$manualTraceInput);
 
-$source=detect_trace_source($stationMode,$traceMode,$manualTraceInput);$activeTrace=(string)$source['path'];
+$source=detect_trace_source($stationMode,$traceMode,$manualTraceInput);
+$source=enrich_source_with_start_context($source);
+$activeTrace=(string)$source['path'];
 $includeRotated=bool_param('rotated',false);$displayLimit=int_param('limit',DEFAULT_DISPLAY_LIMIT,25,MAX_DISPLAY_LIMIT);$liveRefresh=int_param('live',DEFAULT_LIVE_REFRESH,0,60);
 $severityFilter=strtolower(trim((string)($_GET['severity']??'all')));$eventFilter=trim((string)($_GET['event']??''));$searchFilter=trim((string)($_GET['q']??''));$onlyProblems=bool_param('problems',true);$showTimeout110=bool_param('show_timeout110',true);
 $validSeverities=['all','critical','error','warning','info'];if(!in_array($severityFilter,$validSeverities,true))$severityFilter='all';
