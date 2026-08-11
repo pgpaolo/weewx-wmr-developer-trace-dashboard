@@ -1,0 +1,60 @@
+name: Validate
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  php-validation:
+    name: PHP syntax and metadata
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        php-version: ["8.2", "8.3"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          coverage: none
+
+      - name: Show PHP version
+        run: php --version
+
+      - name: Lint PHP files
+        shell: bash
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r -d '' file; do
+            found=1
+            php -l "$file"
+          done < <(find . -type f -name '*.php' -print0)
+          if [ "$found" -eq 0 ]; then
+            echo "No PHP files found."
+            exit 1
+          fi
+
+      - name: Check v2.8 metadata consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="v2.8"
+
+          grep -Fq "$expected" index.php
+          grep -Fq "$expected" README.md
+          grep -Fq "$expected" README-IT.md
+          grep -Fq "$expected" CHANGELOG.md
+
+          echo "Dashboard metadata is consistent with $expected."
