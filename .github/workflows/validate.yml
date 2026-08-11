@@ -2,10 +2,13 @@ name: Validate
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
+      - develop
 
   pull_request:
-    branches: ["main"]
+    branches:
+      - main
 
   workflow_dispatch:
 
@@ -14,12 +17,15 @@ permissions:
 
 jobs:
   php-validation:
-    name: PHP syntax and metadata
+    name: PHP syntax and metadata (${{ matrix.php-version }})
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
-        php-version: ["8.2", "8.3"]
+        php-version:
+          - "8.2"
+          - "8.3"
 
     steps:
       - name: Checkout repository
@@ -43,32 +49,75 @@ jobs:
 
           while IFS= read -r -d '' file; do
             found=1
+            echo "Linting: $file"
             php -l "$file"
           done < <(find . -type f -name '*.php' -print0)
 
           if [ "$found" -eq 0 ]; then
-            echo "No PHP files found."
+            echo "ERROR: No PHP files found."
             exit 1
           fi
+
+      - name: Check VERSION file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f VERSION ]; then
+            echo "ERROR: VERSION file not found."
+            exit 1
+          fi
+
+          version="$(tr -d '[:space:]' < VERSION)"
+
+          if [ -z "$version" ]; then
+            echo "ERROR: VERSION file is empty."
+            exit 1
+          fi
+
+          echo "Repository VERSION: ${version}"
 
       - name: Check version metadata consistency
         shell: bash
         run: |
           set -euo pipefail
 
-          if [ ! -f VERSION ]; then
-            echo "VERSION file not found."
-            exit 1
-          fi
-
           version="$(tr -d '[:space:]' < VERSION)"
           expected="v${version}"
 
-          echo "Repository version: ${expected}"
+          echo "Expected version marker: ${expected}"
 
-          grep -Fq "$expected" index.php
-          grep -Fq "$expected" README.md
-          grep -Fq "$expected" README-IT.md
-          grep -Fq "$expected" CHANGELOG.md
+          files=(
+            "index.php"
+            "README.md"
+            "README-IT.md"
+            "CHANGELOG.md"
+          )
+
+          for file in "${files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "ERROR: Required file not found: $file"
+              exit 1
+            fi
+
+            if ! grep -Fq "$expected" "$file"; then
+              echo "ERROR: ${expected} not found in $file"
+              exit 1
+            fi
+
+            echo "OK: ${expected} found in $file"
+          done
 
           echo "Dashboard metadata is consistent with ${expected}."
+
+      - name: Run repository checks
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f scripts/check.sh ]; then
+            chmod +x scripts/check.sh
+            ./scripts/check.sh
+          else
+            echo "scripts/check.sh not present - skipping repository checks."
+          fi
