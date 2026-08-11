@@ -199,4 +199,4 @@ Indicazioni principali:
 
 ## Licenza
 
-Questo aggiornamento documentale non introduce una nuova licenza. Vanno preservati i requisiti di licenza e attribuzione del codice sottostante e degli eventuali componenti upstream.
+Questo progetto è distribuito con licenza MIT. Vedi [LICENSE](LICENSE).

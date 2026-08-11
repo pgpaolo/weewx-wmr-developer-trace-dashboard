@@ -199,4 +199,4 @@ The most important rules are:
 
 ## License
 
-No new license is asserted by this metadata update. Preserve the licensing and attribution requirements of the underlying code and upstream components.
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
