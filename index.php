@@ -1,6 +1,6 @@
 <?php
 /**
- * Oregon Scientific WMR Universal Developer Trace Dashboard v2.10.2
+ * Oregon Scientific WMR Universal Developer Trace Dashboard v2.8.1
  *
  * Standalone diagnostics dashboard for the hardened WeeWX drivers:
  *   - WMR100 protocol family: WMR100/WMR100N, WMR88/WMR88A, WMR180/A, WMRS200
@@ -12,22 +12,7 @@
  */
 declare(strict_types=1);
 
-// ============================================================================
-// PRIVATE DEPLOYMENT PROTECTION - REMOVE FOR PUBLIC GITHUB RELEASE: START
-// Remove this entire marked block, including the START/END comments, when
-// publishing the standalone dashboard on GitHub. It depends on the private
-// /authenticator installation and is not required by the public dashboard.
-// In the private deployment it protects HTML, AJAX API, CSV and bundle output
-// before any request handling. CLI remains available for lint/tests.
-// ============================================================================
-if (PHP_SAPI !== 'cli') {
-    define('REQUIRE_ADMIN', true);
-    require_once rtrim((string)($_SERVER['DOCUMENT_ROOT'] ?? ''), '/\\')
-        . '/authenticator/guards/backup_guard.php';
-}
-// ============================================================================
-// PRIVATE DEPLOYMENT PROTECTION - REMOVE FOR PUBLIC GITHUB RELEASE: END
-// ============================================================================
+
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -66,7 +51,7 @@ const MAX_RECORDS_SCANNED = 250000;
 const DEFAULT_DISPLAY_LIMIT = 250;
 const MAX_DISPLAY_LIMIT = 2000;
 const LOCAL_TIMEZONE = 'Europe/Rome';
-const PAGE_TITLE = 'Oregon Scientific WMR Developer Trace v2.10.2';
+const PAGE_TITLE = 'Oregon Scientific WMR Developer Trace v2.8.1';
 const RECENT_HEALTH_WINDOW = 600;
 const DEFAULT_LIVE_REFRESH = 5;
 const API_TAIL_LINES = 6000; // retained only for detection/backward compatibility
