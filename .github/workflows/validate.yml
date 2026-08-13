@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   php-validation:
-    name: PHP syntax and metadata (${{ matrix.php-version }})
+    name: PHP syntax (${{ matrix.php-version }})
     runs-on: ubuntu-latest
 
     strategy:
@@ -51,12 +51,27 @@ jobs:
             found=1
             echo "Linting: $file"
             php -l "$file"
-          done < <(find . -type f -name '*.php' -print0)
+          done < <(
+            find . \
+              -type f \
+              -name '*.php' \
+              -not -path './.git/*' \
+              -not -path './vendor/*' \
+              -print0
+          )
 
           if [ "$found" -eq 0 ]; then
             echo "ERROR: No PHP files found."
             exit 1
           fi
+
+  metadata-validation:
+    name: Version metadata
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
       - name: Check VERSION file
         shell: bash
@@ -101,11 +116,11 @@ jobs:
             fi
 
             if ! grep -Fq "$expected" "$file"; then
-              echo "ERROR: ${expected} not found in $file"
+              echo "ERROR: ${expected} not found in ${file}"
               exit 1
             fi
 
-            echo "OK: ${expected} found in $file"
+            echo "OK: ${expected} found in ${file}"
           done
 
           echo "Dashboard metadata is consistent with ${expected}."
@@ -121,3 +136,31 @@ jobs:
           else
             echo "scripts/check.sh not present - skipping repository checks."
           fi
+
+  repository-validation:
+    name: Repository validation
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs:
+      - php-validation
+      - metadata-validation
+
+    steps:
+      - name: Verify required jobs
+        shell: bash
+        env:
+          PHP_RESULT: ${{ needs.php-validation.result }}
+          METADATA_RESULT: ${{ needs.metadata-validation.result }}
+        run: |
+          set -euo pipefail
+
+          echo "PHP validation: ${PHP_RESULT}"
+          echo "Metadata validation: ${METADATA_RESULT}"
+
+          if [ "${PHP_RESULT}" != "success" ] ||
+             [ "${METADATA_RESULT}" != "success" ]; then
+            echo "ERROR: One or more required validation jobs failed."
+            exit 1
+          fi
+
+          echo "All repository validations passed."
