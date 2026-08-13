@@ -1,6 +1,6 @@
 <?php
 /**
- * Oregon Scientific WMR Universal Developer Trace Dashboard v2.8
+ * Oregon Scientific WMR Universal Developer Trace Dashboard v2.8.1
  *
  * Standalone diagnostics dashboard for the hardened WeeWX drivers:
  *   - WMR100 protocol family: WMR100/WMR100N, WMR88/WMR88A, WMR180/A, WMRS200
@@ -11,6 +11,8 @@
  * are available from the UI.
  */
 declare(strict_types=1);
+
+
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -28,12 +30,28 @@ const MANUAL_TRACE_ALLOWED_ROOTS = [
     '/var/log/weewx',
     '/tmp',
 ];
+const WEEWX_CONFIG_CANDIDATES = [
+    '/etc/weewx/weewx.conf',
+    '/home/weewx/weewx.conf',
+];
+const DRIVER_SOURCE_CANDIDATES = [
+    'wmr100' => [
+        '/etc/weewx/bin/user/wmr100.py',
+        '/usr/share/weewx/user/wmr100.py',
+        '/home/weewx/bin/user/wmr100.py',
+    ],
+    'wmr200' => [
+        '/etc/weewx/bin/user/wmr200.py',
+        '/usr/share/weewx/user/wmr200.py',
+        '/home/weewx/bin/user/wmr200.py',
+    ],
+];
 const TRACE_BACKUPS = 5;
 const MAX_RECORDS_SCANNED = 250000;
 const DEFAULT_DISPLAY_LIMIT = 250;
 const MAX_DISPLAY_LIMIT = 2000;
 const LOCAL_TIMEZONE = 'Europe/Rome';
-const PAGE_TITLE = 'Oregon Scientific WMR Developer Trace v2.8';
+const PAGE_TITLE = 'Oregon Scientific WMR Developer Trace v2.8.1';
 const RECENT_HEALTH_WINDOW = 600;
 const DEFAULT_LIVE_REFRESH = 5;
 const API_TAIL_LINES = 6000; // retained only for detection/backward compatibility
@@ -225,6 +243,71 @@ function tail_lines(string $file, int $maxLines): array
     return $lines;
 }
 
+function family_from_identifier(?string $value): ?string
+{
+    $value = strtolower(trim((string)$value));
+    if ($value === '') return null;
+    if (str_contains($value, 'wmr200')) return 'wmr200';
+    foreach (['wmr100','wmr88','wmr180','wmrs200'] as $identifier) {
+        if (str_contains($value, $identifier)) return 'wmr100';
+    }
+    return null;
+}
+
+function trace_path_is_allowed(string $path): bool
+{
+    $path = trim($path);
+    if ($path === '' || !str_starts_with($path, '/') || !preg_match('/\.jsonl$/i', basename($path))) return false;
+    foreach (MANUAL_TRACE_ALLOWED_ROOTS as $root) {
+        $root = rtrim($root, '/');
+        if ($path === $root || str_starts_with($path, $root.'/')) return true;
+    }
+    return false;
+}
+
+function detect_weewx_configuration(?array $paths = null): array
+{
+    $result = [
+        'family'=>null, 'station_type'=>null, 'driver'=>null,
+        'trace_path'=>null, 'trace_enabled'=>null, 'config_path'=>null,
+    ];
+    foreach ($paths ?? WEEWX_CONFIG_CANDIDATES as $path) {
+        if (!is_file($path) || !is_readable($path)) continue;
+        $lines = @file($path, FILE_IGNORE_NEW_LINES);
+        if (!is_array($lines)) continue;
+
+        $sections = [];
+        $section = '';
+        foreach ($lines as $line) {
+            if (preg_match('/^\s*\[([^\[\]]+)\]\s*(?:[#;].*)?$/', $line, $m)) {
+                $section = strtolower(trim($m[1]));
+                continue;
+            }
+            if ($section === '' || !preg_match('/^\s*([A-Za-z0-9_.-]+)\s*=\s*(.*?)\s*$/', $line, $m)) continue;
+            $value = trim(preg_replace('/\s+[#;].*$/', '', $m[2]) ?? $m[2]);
+            $value = trim($value, " \t\n\r\0\x0B\"'");
+            $sections[$section][strtolower($m[1])] = $value;
+        }
+
+        $stationType = $sections['station']['station_type'] ?? null;
+        $stationSection = strtolower(trim((string)$stationType));
+        $stationValues = $stationSection !== '' ? ($sections[$stationSection] ?? []) : [];
+        $driver = $stationValues['driver'] ?? null;
+        $family = family_from_identifier($stationType) ?? family_from_identifier($driver);
+        if ($family === null) continue;
+
+        $tracePath = trim((string)($stationValues['developer_trace_path'] ?? ''));
+        if (!trace_path_is_allowed($tracePath)) $tracePath = null;
+        $enabledRaw = strtolower(trim((string)($stationValues['developer_trace'] ?? '')));
+        $enabled = $enabledRaw === '' ? null : in_array($enabledRaw, ['1','true','yes','on'], true);
+        return [
+            'family'=>$family, 'station_type'=>$stationType, 'driver'=>$driver,
+            'trace_path'=>$tracePath, 'trace_enabled'=>$enabled, 'config_path'=>$path,
+        ];
+    }
+    return $result;
+}
+
 function validate_manual_trace_path(string $path): array
 {
     $path = trim($path);
@@ -375,7 +458,38 @@ function enrich_source_with_start_context(array $source): array
     return $source;
 }
 
-function detect_trace_source(string $requested = 'auto', string $traceMode = 'auto', string $manualTrace = ''): array
+function detect_installed_driver_version(string $family, ?array $paths = null): ?array
+{
+    $family = $family === 'wmr200' ? 'wmr200' : 'wmr100';
+    foreach ($paths ?? DRIVER_SOURCE_CANDIDATES[$family] as $path) {
+        if (!is_file($path) || !is_readable($path)) continue;
+        $source = @file_get_contents($path, false, null, 0, 262144);
+        if (!is_string($source) || $source === '') continue;
+        if (!preg_match('/^\s*DRIVER_VERSION\s*=\s*["\']([^"\']+)["\']/m', $source, $versionMatch)) continue;
+        preg_match('/^\s*DRIVER_NAME\s*=\s*["\']([^"\']+)["\']/m', $source, $nameMatch);
+        return [
+            'version'=>trim($versionMatch[1]),
+            'driver'=>isset($nameMatch[1]) ? trim($nameMatch[1]) : strtoupper($family),
+            'path'=>$path,
+        ];
+    }
+    return null;
+}
+
+function enrich_source_with_installed_driver(array $source, ?array $paths = null): array
+{
+    $currentVersion = trim((string)($source['version'] ?? ''));
+    if ($currentVersion !== '' && strtolower($currentVersion) !== 'sconosciuta') return $source;
+    $installed = detect_installed_driver_version((string)($source['family'] ?? 'wmr100'), $paths);
+    if ($installed === null) return $source;
+    $source['version'] = $installed['version'];
+    if (empty($source['driver'])) $source['driver'] = $installed['driver'];
+    $source['installed_driver_path'] = $installed['path'];
+    $source['version_source'] = 'installed_driver';
+    return $source;
+}
+
+function detect_trace_source(string $requested = 'auto', string $traceMode = 'auto', string $manualTrace = '', ?array $configPaths = null): array
 {
     $requested = strtolower($requested);
     if (!in_array($requested, ['auto','wmr100','wmr200'], true)) $requested = 'auto';
@@ -413,9 +527,17 @@ function detect_trace_source(string $requested = 'auto', string $traceMode = 'au
     }
 
     // Automatic mode deliberately ignores trace_file, even if an old value
-    // is still present in the URL. The newest matching known trace wins.
+    // is still present in the URL. Read WeeWX configuration as a second,
+    // independent source of truth: this identifies the family and a custom
+    // developer_trace_path even before the JSONL file has been created.
+    $config = detect_weewx_configuration($configPaths);
     $probes = [];
-    foreach (TRACE_CANDIDATES as $family => $paths) {
+    $candidateMap = TRACE_CANDIDATES;
+    if ($config['family'] !== null && $config['trace_path'] !== null) {
+        array_unshift($candidateMap[$config['family']], $config['trace_path']);
+        $candidateMap[$config['family']] = array_values(array_unique($candidateMap[$config['family']]));
+    }
+    foreach ($candidateMap as $family => $paths) {
         if ($requested !== 'auto' && $requested !== $family) continue;
         foreach ($paths as $path) {
             $probe = probe_trace_file($path, $family);
@@ -430,16 +552,26 @@ function detect_trace_source(string $requested = 'auto', string $traceMode = 'au
         $selected['auto_detected'] = $requested === 'auto';
         $selected['manual_trace'] = false;
         $selected['manual_trace_error'] = null;
+        $selected['detection_basis'] = 'trace';
+        $selected['configured_family'] = $config['family'];
+        $selected['config_path'] = $config['config_path'];
+        $selected['trace_enabled'] = $config['trace_enabled'];
         $selected['probes'] = $probes;
         return $selected;
     }
-    $family = $requested === 'wmr200' ? 'wmr200' : 'wmr100';
+    $configuredFamily = in_array($config['family'], ['wmr100','wmr200'], true) ? $config['family'] : null;
+    $family = $requested === 'wmr200' ? 'wmr200' : ($requested === 'wmr100' ? 'wmr100' : ($configuredFamily ?? 'wmr100'));
+    $configuredPath = $configuredFamily === $family ? $config['trace_path'] : null;
     return [
         'family'=>$family,
-        'path'=>TRACE_CANDIDATES[$family][0],
+        'path'=>$configuredPath ?? TRACE_CANDIDATES[$family][0],
         'latest_timestamp'=>null,'latest_epoch'=>0.0,'driver'=>null,'version'=>null,'model'=>null,
-        'size'=>0,'mtime'=>0,'mode'=>$requested,'trace_mode'=>'auto','auto_detected'=>$requested==='auto',
-        'manual_trace'=>false,'manual_trace_error'=>null,'probes'=>[],
+        'size'=>0,'mtime'=>0,'mode'=>$requested,'trace_mode'=>'auto',
+        'auto_detected'=>$requested==='auto'&&$configuredFamily!==null,
+        'manual_trace'=>false,'manual_trace_error'=>null,
+        'detection_basis'=>$requested==='auto'&&$configuredFamily!==null?'config':'fallback',
+        'configured_family'=>$configuredFamily,'config_path'=>$config['config_path'],
+        'trace_enabled'=>$config['trace_enabled'],'probes'=>[],
     ];
 }
 
@@ -630,6 +762,9 @@ function common_field_from_wmr200(string $key): string
         'rain_fault'=>'rainFault','uv_fault'=>'uvFault','clock_unsynchronized'=>'clockUnsynchronized'
     ];
     if(isset($direct[$key]))return $direct[$key];
+    // Forward-compatible aliases. The current WMR200 Status packet does not
+    // expose console backup-battery state, but future/custom drivers may do so.
+    if(in_array($key,['battery_status_console','battery_status_in','battery_status_0'],true))return 'inTempBatteryStatus';
     if(preg_match('/^temperature_(\d+)$/',$key,$m))return channel_field((int)$m[1],'temp');
     if(preg_match('/^humidity_(\d+)$/',$key,$m))return channel_field((int)$m[1],'hum');
     if(preg_match('/^heatindex_(\d+)$/',$key,$m))return channel_field((int)$m[1],'heat');
@@ -798,6 +933,16 @@ function weather_value(string $key, mixed $value, string $family='wmr100'): stri
     if($key==='clockUnsynchronized')return ((int)$n===0)?'Sincronizzato':'Non sincronizzato';
     if($key==='forecastIcon'){ $f=forecast_info((int)$n,$family); return $f['label'].' · codice '.(int)$n; }
     return number_format($n,2,',','.');
+}
+
+function battery_state(mixed $value): array
+{
+    if ($value === null || $value === '' || !is_numeric($value)) {
+        return ['unknown', 'Non disponibile'];
+    }
+    return ((int)$value === 0)
+        ? ['ok', 'Carica']
+        : ['low', 'Bassa'];
 }
 
 function sparkline_svg(array $values): string
@@ -1265,7 +1410,16 @@ function render_console_strip(array $a): string
       <div><span>Console</span><strong><?=h($m['model']??'N/D')?></strong></div>
       <div><span>Famiglia</span><strong><?=h(strtoupper($a['family']))?></strong></div>
       <div><span>Driver</span><strong><?=h($m['driver_version']??'N/D')?></strong></div>
-      <?php $detectLabel=($a['source']['manual_trace']??false)?'TRACE MANUALE':(($a['source']['auto_detected']??false)?'AUTO':'FAMIGLIA MANUALE'); $detectClass=($a['source']['auto_detected']??false)?'ok':'info'; ?>
+      <?php
+        $manualError=($a['source']['manual_trace']??false)&&!empty($a['source']['manual_trace_error']);
+        $basis=(string)($a['source']['detection_basis']??'');
+        if($manualError){$detectLabel='TRACE MANUALE NON DISPONIBILE';$detectClass='warning';}
+        elseif($a['source']['manual_trace']??false){$detectLabel='TRACE MANUALE';$detectClass='info';}
+        elseif($basis==='config'){$detectLabel='CONFIG WEEWX';$detectClass='ok';}
+        elseif($basis==='trace'&&($a['source']['auto_detected']??false)){$detectLabel='AUTO · TRACE';$detectClass='ok';}
+        elseif($basis==='fallback'&&($a['source']['mode']??'auto')==='auto'){$detectLabel='NON RILEVATA';$detectClass='warning';}
+        else{$detectLabel='FAMIGLIA MANUALE';$detectClass='info';}
+      ?>
       <div><span>Rilevamento</span><strong class="<?=h($detectClass)?>"><?=h($detectLabel)?></strong></div>
       <div><span>USB / profilo</span><strong class="mono"><?=h($a['family']==='wmr100'?$usb:($m['model_profile']??'wmr200'))?></strong></div>
       <div><span>Session uptime</span><strong><?=h($uptime)?></strong></div>
@@ -1350,6 +1504,74 @@ function sensor_channel_definition(int $ch): array
     return ['name'=>'CH'.$ch.' · Sensore remoto','temp'=>'channelTemp'.$ch,'hum'=>'channelHumid'.$ch,'battery'=>'channelBattery'.$ch];
 }
 
+function battery_definitions(array $a): array
+{
+    $definitions = [];
+    if ($a['family'] === 'wmr100') {
+        $max = max(1, min(8, (int)($a['meta']['max_remote_channels'] ?? 3)));
+        for ($ch = 0; $ch <= $max; $ch++) {
+            $sensor = sensor_channel_definition($ch);
+            $definitions[] = [
+                'name' => $ch === 0 ? 'Console interna' : ($ch === 1 ? 'Sensore esterno' : 'Sensore remoto CH'.$ch),
+                'field' => $sensor['battery'],
+                'packet' => 'temperature_humidity',
+            ];
+        }
+    } else {
+        $definitions[] = [
+            'name'=>'Console / batterie backup',
+            'field'=>'inTempBatteryStatus',
+            'packet'=>'status',
+            'unavailable_label'=>'Non trasmesso dal WMR200',
+            'unavailable_note'=>'Il pacchetto Status espone solo le batterie dei sensori esterni',
+        ];
+        $definitions[] = ['name'=>'Sensore esterno', 'field'=>'outTempBatteryStatus', 'packet'=>'status'];
+    }
+    $definitions[] = ['name'=>'Anemometro', 'field'=>'windBatteryStatus', 'packet'=>$a['family']==='wmr200'?'status':'wind'];
+    $definitions[] = ['name'=>'Pluviometro', 'field'=>'rainBatteryStatus', 'packet'=>$a['family']==='wmr200'?'status':'rain'];
+    $definitions[] = ['name'=>'Sensore UV', 'field'=>'uvBatteryStatus', 'packet'=>$a['family']==='wmr200'?'status':'uv'];
+    return $definitions;
+}
+
+function render_batteries(array $a): string
+{
+    $items = [];
+    $available = 0;
+    $low = 0;
+    $unknown = 0;
+    foreach (battery_definitions($a) as $definition) {
+        $reading = reading($a, $definition['field']);
+        [$state, $label] = battery_state($reading['value'] ?? null);
+        if ($state !== 'unknown') $available++;
+        if ($state === 'low') $low++;
+        if ($state === 'unknown') $unknown++;
+        $items[] = $definition + ['reading'=>$reading, 'state'=>$state, 'label'=>$label];
+    }
+
+    $summaryLabel = 'Stato batterie non disponibile';
+    if ($low > 0) {
+        $summaryLabel = $low.' '.($low === 1 ? 'batteria da sostituire' : 'batterie da sostituire');
+    } elseif ($available > 0) {
+        $summaryLabel = $unknown > 0 ? 'Batterie rilevate regolari · '.$unknown.' '.($unknown === 1 ? 'non disponibile' : 'non disponibili') : 'Batterie regolari';
+    }
+    $summaryClass = $low > 0 ? 'has-low' : ($available > 0 ? ($unknown > 0 ? 'partial' : 'all-ok') : 'unknown');
+
+    ob_start(); ?>
+    <div class="battery-summary <?= h($summaryClass) ?>">
+      <div><span class="battery-summary-icon" aria-hidden="true"><span></span></span><strong><?= h($summaryLabel) ?></strong></div>
+      <span><?= $available ?> rilevate su <?= count($items) ?></span>
+    </div>
+    <div class="battery-grid">
+    <?php foreach ($items as $item): $r=$item['reading']; $age=$r?reading_age($r):null; ?>
+      <article class="battery-card <?= h($item['state']) ?>">
+        <div class="battery-visual" aria-hidden="true"><span></span></div>
+        <div class="battery-copy"><strong><?= h($item['name']) ?></strong><span><?= h($r?$item['label']:($item['unavailable_label']??$item['label'])) ?></span><?php if($r): ?><small>letto <?= h(format_age($age)) ?> · <?= h(local_timestamp($r['timestamp'],false)) ?></small><?php else: ?><small><?= h($item['unavailable_note']??'Nessun dato nel trace analizzato') ?></small><?php endif; ?></div>
+      </article>
+    <?php endforeach; ?>
+    </div>
+    <?php return (string)ob_get_clean();
+}
+
 function render_sensors(array $a): string
 {
     if($a['family']!=='wmr100')return '';
@@ -1398,8 +1620,19 @@ function render_sessions(array $a): string
 function render_simple_counts(array $counts,int $limit=16): string
 {ob_start();$i=0;foreach($counts as $name=>$count){if($i++>=$limit)break;?><div class="list-row"><span class="name mono" title="<?=h($name)?>"><?=h($name)?></span><span class="count"><?=number_format((int)$count,0,',','.')?></span></div><?php }return(string)ob_get_clean();}
 
+function render_driver_versions(array $a): string
+{
+    $driver=trim((string)($a['meta']['driver']??strtoupper((string)($a['family']??'WMR'))));
+    if($driver==='')$driver=strtoupper((string)($a['family']??'WMR'));
+    $versions=$a['versions']??[];
+    ob_start();
+    if($versions){$i=0;foreach($versions as $version=>$count){if($i++>=8)break;$label=$driver.' · '.$version;?><div class="list-row"><span class="name mono" title="<?=h($label)?>"><?=h($label)?></span><span class="count" title="Eventi driver_start"><?=number_format((int)$count,0,',','.')?> avv.</span></div><?php }}
+    else{$version=trim((string)($a['meta']['driver_version']??''));$known=$version!==''&&strtolower($version)!=='sconosciuta';$label=$driver.' · '.($known?$version:'versione non rilevata');?><div class="list-row"><span class="name mono" title="<?=h($label)?>"><?=h($label)?></span><span class="count"><?=$known?'corrente':'—'?></span></div><?php }
+    return(string)ob_get_clean();
+}
+
 function api_payload(array $a): array
-{return ['generated'=>(new DateTimeImmutable('now',new DateTimeZone(LOCAL_TIMEZONE)))->format('d/m/Y H:i:s T'),'family'=>$a['family'],'family_title'=>family_title($a['family']),'source'=>$a['source']['path'],'health'=>$a['health'],'last_rx_age'=>$a['last_rx_age'],'last_sequence'=>max(array_map('intval',array_column($a['rows'],'sequence'))?:[0]),'show_sensors'=>$a['family']==='wmr100','model'=>(string)($a['meta']['model']??'WMR'),'max_remote_channels'=>(int)($a['meta']['max_remote_channels']??0),'html'=>['console'=>render_console_strip($a),'cards'=>render_cards($a),'weather'=>render_weather($a),'sensors'=>$a['family']==='wmr100'?render_sensors($a):'','protocol'=>render_protocol($a),'timeline'=>render_timeline($a),'events'=>render_event_rows($a),'sessions'=>render_sessions($a),'event_counts'=>render_simple_counts($a['event_counts']),'packet_counts'=>render_simple_counts($a['packet_counts']),'versions'=>render_simple_counts($a['versions'])]];}
+{return ['generated'=>(new DateTimeImmutable('now',new DateTimeZone(LOCAL_TIMEZONE)))->format('d/m/Y H:i:s T'),'family'=>$a['family'],'family_title'=>family_title($a['family']),'source'=>$a['source']['path'],'health'=>$a['health'],'last_rx_age'=>$a['last_rx_age'],'last_sequence'=>max(array_map('intval',array_column($a['rows'],'sequence'))?:[0]),'show_sensors'=>$a['family']==='wmr100','model'=>(string)($a['meta']['model']??'WMR'),'max_remote_channels'=>(int)($a['meta']['max_remote_channels']??0),'html'=>['console'=>render_console_strip($a),'cards'=>render_cards($a),'weather'=>render_weather($a),'batteries'=>render_batteries($a),'sensors'=>$a['family']==='wmr100'?render_sensors($a):'','protocol'=>render_protocol($a),'timeline'=>render_timeline($a),'events'=>render_event_rows($a),'sessions'=>render_sessions($a),'event_counts'=>render_simple_counts($a['event_counts']),'packet_counts'=>render_simple_counts($a['packet_counts']),'versions'=>render_driver_versions($a)]];}
 
 // -----------------------------------------------------------------------------
 // Diagnostic bundle
@@ -1442,6 +1675,7 @@ if($traceFileExplicit&&$manualTraceInput!=='')set_source_pref_cookie(SOURCE_PREF
 
 $source=detect_trace_source($stationMode,$traceMode,$manualTraceInput);
 $source=enrich_source_with_start_context($source);
+$source=enrich_source_with_installed_driver($source);
 $activeTrace=(string)$source['path'];
 $includeRotated=bool_param('rotated',false);$displayLimit=int_param('limit',DEFAULT_DISPLAY_LIMIT,25,MAX_DISPLAY_LIMIT);$liveRefresh=int_param('live',DEFAULT_LIVE_REFRESH,0,60);
 $severityFilter=strtolower(trim((string)($_GET['severity']??'all')));$eventFilter=trim((string)($_GET['event']??''));$searchFilter=trim((string)($_GET['q']??''));$onlyProblems=bool_param('problems',true);$showTimeout110=bool_param('show_timeout110',true);
@@ -1449,7 +1683,7 @@ $validSeverities=['all','critical','error','warning','info'];if(!in_array($sever
 $options=['limit'=>$displayLimit,'severity'=>$severityFilter,'event'=>$eventFilter,'q'=>$searchFilter,'problems'=>$onlyProblems,'show_timeout110'=>$showTimeout110];$files=trace_files($activeTrace,$includeRotated);
 if(isset($_GET['download'])&&$_GET['download']==='bundle')download_diagnostic_bundle($source,$files);
 if(isset($_GET['download'])&&$_GET['download']==='csv'){$analysis=analyse_trace($source,$files,$options,0);header('Content-Type:text/csv;charset=UTF-8');header('Content-Disposition:attachment; filename="wmr-'.$source['family'].'-trace-'.date('Ymd-His').'.csv"');echo"\xEF\xBB\xBF";$out=fopen('php://output','wb');fputcsv($out,['timestamp_locale','family','severity','event','direction','sequence','details','json']);foreach(array_reverse($analysis['rows']) as $row)fputcsv($out,[local_timestamp($row['timestamp']),$source['family'],$row['severity'],$row['event'],$row['direction'],$row['sequence'],$row['details'],$row['raw']]);fclose($out);exit;}
-if(isset($_GET['api'])&&$_GET['api']==='1'){$liveSource=detect_trace_source($stationMode,$traceMode,$manualTraceInput);$analysis=analyse_trace_incremental($liveSource,$options);header('Content-Type:application/json;charset=UTF-8');header('Cache-Control:no-store,max-age=0,must-revalidate');header('Pragma:no-cache');echo json_encode(api_payload($analysis),JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE);exit;}
+if(isset($_GET['api'])&&$_GET['api']==='1'){$liveSource=detect_trace_source($stationMode,$traceMode,$manualTraceInput);$liveSource=enrich_source_with_start_context($liveSource);$liveSource=enrich_source_with_installed_driver($liveSource);$analysis=analyse_trace_incremental($liveSource,$options);header('Content-Type:application/json;charset=UTF-8');header('Cache-Control:no-store,max-age=0,must-revalidate');header('Pragma:no-cache');echo json_encode(api_payload($analysis),JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE);exit;}
 if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$files,$options,0);prime_live_cache($source,$options,$rawAnalysis);$analysis=finalized_analysis($rawAnalysis);}else{$analysis=analyse_trace($source,$files,$options,0);}$queryForCsv=$_GET;$queryForCsv['download']='csv';unset($queryForCsv['api']);$csvUrl='?'.http_build_query($queryForCsv);$queryForBundle=$_GET;$queryForBundle['download']='bundle';unset($queryForBundle['api']);$bundleUrl='?'.http_build_query($queryForBundle);
 ?>
 <!doctype html>
@@ -1463,14 +1697,16 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% 0,#17233b 0,transparent 32%),var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;font-size:14px}.wrap{max-width:1600px;margin:auto;padding:22px}.top{display:flex;gap:18px;align-items:flex-start;justify-content:space-between;margin-bottom:12px}.title h1{margin:0;font-size:26px;letter-spacing:-.02em}.title p{margin:6px 0 0;color:var(--muted)}.status{display:flex;align-items:center;gap:9px;padding:10px 14px;border:1px solid var(--border);border-radius:999px;background:rgba(17,24,39,.85);box-shadow:var(--shadow);font-weight:700}.dot{width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 16px currentColor}.status.warning .dot{background:var(--warn)}.status.error .dot{background:var(--error)}.status.critical .dot{background:var(--critical)}.panel{background:rgba(17,24,39,.88);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow)}.notice{padding:14px 16px;margin-bottom:16px}.notice.error{border-color:rgba(249,112,102,.5);background:rgba(249,112,102,.08)}.notice.warning{border-color:rgba(253,176,34,.5);background:rgba(253,176,34,.07)}.ok{color:var(--ok)}.warning{color:var(--warn)}.error{color:var(--error)}.critical{color:var(--critical)}.info{color:var(--info)}.muted{color:var(--muted)}[hidden]{display:none!important}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .console-strip{display:grid;grid-template-columns:repeat(9,minmax(115px,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:14px;overflow:hidden;margin-bottom:16px}.console-strip>div{background:rgba(17,24,39,.95);padding:10px 12px;min-height:62px}.console-strip span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.06em}.console-strip strong{display:block;margin-top:6px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cards{display:grid;grid-template-columns:repeat(8,minmax(130px,1fr));gap:12px;margin-bottom:16px}.card{padding:14px 15px;min-height:94px}.card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}.card .value{font-size:26px;font-weight:800;margin-top:9px}.card .sub{color:var(--muted);margin-top:4px;font-size:11px;line-height:1.35}
-.section-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:15px 16px;border-bottom:1px solid var(--border)}.section-head h2{font-size:16px;margin:0}.section-head span{color:var(--muted);font-size:12px}.weather-panel,.sensor-panel,.protocol-panel,.timeline-panel{margin-bottom:16px;overflow:hidden}.weather-grid{display:grid;grid-template-columns:repeat(3,minmax(280px,1fr));gap:12px;padding:14px}.weather-card,.sensor-card{background:rgba(8,16,29,.52);border:1px solid var(--border);border-radius:14px;overflow:hidden}.weather-card.fresh,.sensor-card.fresh{border-color:rgba(50,213,131,.38)}.weather-card.delayed,.sensor-card.delayed{border-color:rgba(253,176,34,.48)}.weather-card.stale,.weather-card.missing,.sensor-card.stale,.sensor-card.missing{border-color:rgba(249,112,102,.48)}.weather-head,.sensor-head{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 13px;border-bottom:1px solid rgba(39,52,73,.7)}.weather-head h3{font-size:14px;margin:0}.weather-head-right{display:flex;align-items:center;gap:10px}.spark{width:116px;height:30px;color:#7ea5df;opacity:.9}.freshness{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;border-radius:999px;padding:4px 8px;white-space:nowrap}.freshness.fresh{background:rgba(50,213,131,.14);color:var(--ok)}.freshness.delayed{background:rgba(253,176,34,.14);color:var(--warn)}.freshness.stale,.freshness.missing{background:rgba(249,112,102,.14);color:var(--error)}.metrics{padding:5px 13px}.metric{display:grid;grid-template-columns:minmax(130px,1fr) auto;gap:12px;padding:7px 0;border-bottom:1px solid rgba(39,52,73,.42)}.metric:last-child{border-bottom:0}.metric-name{color:#aebbd0}.metric-value{text-align:right;font-weight:800;font-variant-numeric:tabular-nums}.metric-age{grid-column:1/-1;text-align:right;color:var(--muted);font-size:10px;margin-top:-5px}.weather-foot{padding:10px 13px;background:rgba(23,32,51,.5);color:var(--muted);font-size:11px;line-height:1.55}
+.section-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:15px 16px;border-bottom:1px solid var(--border)}.section-head h2{font-size:16px;margin:0}.section-head span{color:var(--muted);font-size:12px}.weather-panel,.battery-panel,.sensor-panel,.protocol-panel,.timeline-panel{margin-bottom:16px;overflow:hidden}.weather-grid{display:grid;grid-template-columns:repeat(3,minmax(280px,1fr));gap:12px;padding:14px}.weather-card,.sensor-card{background:rgba(8,16,29,.52);border:1px solid var(--border);border-radius:14px;overflow:hidden}.weather-card.fresh,.sensor-card.fresh{border-color:rgba(50,213,131,.38)}.weather-card.delayed,.sensor-card.delayed{border-color:rgba(253,176,34,.48)}.weather-card.stale,.weather-card.missing,.sensor-card.stale,.sensor-card.missing{border-color:rgba(249,112,102,.48)}.weather-head,.sensor-head{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 13px;border-bottom:1px solid rgba(39,52,73,.7)}.weather-head h3{font-size:14px;margin:0}.weather-head-right{display:flex;align-items:center;gap:10px}.spark{width:116px;height:30px;color:#7ea5df;opacity:.9}.freshness{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;border-radius:999px;padding:4px 8px;white-space:nowrap}.freshness.fresh{background:rgba(50,213,131,.14);color:var(--ok)}.freshness.delayed{background:rgba(253,176,34,.14);color:var(--warn)}.freshness.stale,.freshness.missing{background:rgba(249,112,102,.14);color:var(--error)}.metrics{padding:5px 13px}.metric{display:grid;grid-template-columns:minmax(130px,1fr) auto;gap:12px;padding:7px 0;border-bottom:1px solid rgba(39,52,73,.42)}.metric:last-child{border-bottom:0}.metric-name{color:#aebbd0}.metric-value{text-align:right;font-weight:800;font-variant-numeric:tabular-nums}.metric-age{grid-column:1/-1;text-align:right;color:var(--muted);font-size:10px;margin-top:-5px}.weather-foot{padding:10px 13px;background:rgba(23,32,51,.5);color:var(--muted);font-size:11px;line-height:1.55}
+.battery-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 16px;border-bottom:1px solid var(--border);background:rgba(96,165,250,.055)}.battery-summary>div{display:flex;align-items:center;gap:10px}.battery-summary>span{color:var(--muted);font-size:11px}.battery-summary-icon,.battery-visual{position:relative;display:inline-flex;border:2px solid currentColor;border-radius:4px}.battery-summary-icon{width:27px;height:14px}.battery-summary-icon:after,.battery-visual:after{content:"";position:absolute;right:-5px;top:25%;width:3px;height:50%;border-radius:0 2px 2px 0;background:currentColor}.battery-summary-icon span,.battery-visual span{display:block;margin:2px;background:currentColor;border-radius:1px}.battery-summary.all-ok{color:var(--ok)}.battery-summary.has-low{color:var(--warn)}.battery-summary.unknown{color:var(--muted)}.battery-summary.all-ok .battery-summary-icon span{width:100%}.battery-summary.has-low .battery-summary-icon span{width:28%}.battery-summary.unknown .battery-summary-icon span{width:0}.battery-grid{display:grid;grid-template-columns:repeat(4,minmax(210px,1fr));gap:12px;padding:14px}.battery-card{display:grid;grid-template-columns:42px minmax(0,1fr);gap:12px;align-items:center;min-height:86px;padding:12px;background:rgba(8,16,29,.52);border:1px solid var(--border);border-radius:14px}.battery-card.ok{color:var(--ok);border-color:rgba(50,213,131,.38)}.battery-card.low{color:var(--warn);border-color:rgba(253,176,34,.55);background:rgba(253,176,34,.055)}.battery-card.unknown{color:var(--muted)}.battery-visual{width:36px;height:20px}.battery-card.ok .battery-visual span{width:100%}.battery-card.low .battery-visual span{width:25%}.battery-card.unknown .battery-visual span{width:0}.battery-copy{min-width:0}.battery-copy strong,.battery-copy span,.battery-copy small{display:block}.battery-copy strong{color:var(--text);font-size:12px}.battery-copy span{margin-top:3px;font-size:12px;font-weight:800}.battery-copy small{margin-top:5px;color:var(--muted);font-size:9px;line-height:1.35}
 .sensor-grid{display:grid;grid-template-columns:repeat(4,minmax(230px,1fr));gap:12px;padding:14px}.sensor-head strong{font-size:13px}.sensor-body{padding:8px 12px}.sensor-body>div{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid rgba(39,52,73,.42)}.sensor-body>div:last-child{border-bottom:0}.sensor-body span{color:var(--muted);font-size:11px}.sensor-body b{font-size:12px;text-align:right}
 .protocol-grid{display:grid;grid-template-columns:minmax(420px,.9fr) minmax(460px,1.1fr);gap:14px;padding:14px}.protocol-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.protocol-kpis>div{background:rgba(8,16,29,.52);border:1px solid var(--border);border-radius:12px;padding:12px}.protocol-kpis span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase}.protocol-kpis b{display:block;font-size:22px;margin-top:8px}.protocol-detail{background:rgba(8,16,29,.52);border:1px solid var(--border);border-radius:12px;padding:14px}.protocol-detail h3{margin:0 0 8px;font-size:14px}.protocol-detail p{color:var(--muted);line-height:1.55}.anomaly{border-top:1px solid var(--border);padding-top:10px}.anomaly small{display:block;color:var(--muted);margin:4px 0 8px}.anomaly code,.candidate code{display:block;background:#07101d;border:1px solid var(--border);border-radius:8px;padding:8px;word-break:break-all;color:#bdc9da;margin-top:6px}.candidate{margin-top:10px;padding:10px;border-radius:9px;background:rgba(96,165,250,.08);color:#c9d8ee;line-height:1.5}
 .timeline-list{padding:8px 14px 14px}.timeline-row{position:relative;display:grid;grid-template-columns:16px 1fr;gap:10px;padding:9px 0;border-bottom:1px solid rgba(39,52,73,.5)}.timeline-row:last-child{border-bottom:0}.timeline-dot{width:9px;height:9px;border-radius:50%;margin-top:5px;background:var(--info)}.timeline-dot.warning{background:var(--warn)}.timeline-dot.error{background:var(--error)}.timeline-dot.critical{background:var(--critical)}.timeline-row strong{font-size:12px}.timeline-row small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.timeline-row p{margin:4px 0 0;color:#aab7c8;font-size:11px;line-height:1.4;word-break:break-word}
 .filters{padding:14px;margin-bottom:16px}.filters form{display:block}.filter-source-row{display:grid;grid-template-columns:190px minmax(290px,420px);gap:12px;align-items:end;padding-bottom:13px;margin-bottom:13px;border-bottom:1px solid rgba(39,52,73,.72)}.filter-options-row{display:grid;grid-template-columns:auto auto 150px minmax(170px,1fr) minmax(170px,1fr) 95px 105px auto;gap:10px;align-items:end}.filter-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px;justify-content:flex-end}.field label{display:block;color:var(--muted);font-size:11px;margin:0 0 6px}.field input,.field select{width:100%;height:38px;border-radius:9px;border:1px solid var(--border);background:#0c1424;color:var(--text);padding:0 10px}.check{height:38px;display:flex;align-items:center;gap:8px;color:var(--muted);white-space:nowrap}.check input{accent-color:var(--info)}button,.button{height:38px;border:0;border-radius:9px;padding:0 14px;background:#2563eb;color:white;font-weight:700;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap}.button.secondary{background:#253047;color:var(--text);border:1px solid var(--border)}.button.green{background:#087a55}.live-indicator{display:inline-flex;align-items:center;gap:5px;color:var(--muted)}.live-led{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}.live-led.off{background:#64748b;box-shadow:none}.live-led.error{background:var(--error);box-shadow:0 0 8px var(--error)}.source-switch{display:grid;grid-template-columns:1fr 1fr;height:38px;border:1px solid var(--border);border-radius:10px;overflow:hidden;background:#0c1424}.source-switch label{position:relative;margin:0;cursor:pointer}.source-switch input{position:absolute;opacity:0;pointer-events:none}.source-switch span{height:100%;display:flex;align-items:center;justify-content:center;padding:0 14px;color:var(--muted);font-weight:800;transition:.15s ease}.source-switch label+label span{border-left:1px solid var(--border)}.source-switch input:checked+span{background:#2563eb;color:#fff;box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}.filter-source-row.manual-active{grid-template-columns:190px minmax(290px,420px) minmax(330px,1fr)}.manual-trace-field{transition:opacity .15s ease}.manual-trace-field.disabled{display:none}.source-help{margin-top:6px;color:var(--muted);font-size:11px;line-height:1.35}
-.grid{display:grid;grid-template-columns:minmax(0,2.35fr) minmax(300px,.65fr);gap:16px}.table-wrap{overflow:auto;max-height:680px}table{width:100%;border-collapse:collapse;min-width:980px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid rgba(39,52,73,.72);vertical-align:top}th{position:sticky;top:0;background:#131c2d;color:#a8b4c7;font-size:10px;text-transform:uppercase;letter-spacing:.05em;z-index:2}tr:hover td{background:rgba(96,165,250,.045)}td.time{white-space:nowrap;color:#c7d2e2;font-variant-numeric:tabular-nums}td.event{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:700;white-space:nowrap}.badge{display:inline-flex;padding:3px 8px;border-radius:999px;text-transform:uppercase;font-weight:800;font-size:9px;letter-spacing:.04em}.badge.info{background:rgba(96,165,250,.14);color:#93c5fd}.badge.warning{background:rgba(253,176,34,.14);color:#fdb022}.badge.error{background:rgba(249,112,102,.14);color:#fda29b}.badge.critical{background:rgba(238,70,188,.14);color:#f9a8d4}.details{color:#b4c0d0;line-height:1.45;word-break:break-word}.raw summary{cursor:pointer;color:#7ea5df;margin-top:6px}.raw pre{white-space:pre-wrap;word-break:break-all;background:#08101d;padding:9px;border-radius:8px;color:#91a0b5;font-size:11px}.side{display:flex;flex-direction:column;gap:16px}.list{padding:5px 14px 12px}.list-row{display:flex;justify-content:space-between;gap:12px;padding:9px 2px;border-bottom:1px solid rgba(39,52,73,.55)}.list-row:last-child{border-bottom:0}.list-row .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.list-row .count{font-weight:800;font-variant-numeric:tabular-nums}.session{padding:11px 2px;border-bottom:1px solid rgba(39,52,73,.55)}.session:last-child{border-bottom:0}.session strong{display:block}.session small{display:block;color:var(--muted);margin-top:4px;line-height:1.45}.empty{padding:24px;text-align:center;color:var(--muted)}.footer{color:var(--muted);font-size:11px;margin-top:15px;display:flex;gap:14px;justify-content:space-between}
-@media(max-width:1350px){.console-strip{grid-template-columns:repeat(5,1fr)}.cards{grid-template-columns:repeat(4,1fr)}.filter-source-row{grid-template-columns:180px 300px}.filter-source-row.manual-active{grid-template-columns:180px 300px 1fr}.filter-options-row{grid-template-columns:repeat(4,minmax(150px,1fr))}.protocol-grid{grid-template-columns:1fr}.sensor-grid{grid-template-columns:repeat(3,1fr)}.grid{grid-template-columns:1fr}}@media(max-width:900px){.weather-grid{grid-template-columns:repeat(2,minmax(260px,1fr))}.sensor-grid{grid-template-columns:repeat(2,1fr)}.console-strip{grid-template-columns:repeat(3,1fr)}}@media(max-width:900px){.filter-source-row{grid-template-columns:1fr 1fr}.manual-trace-field{grid-column:1/-1}.filter-options-row{grid-template-columns:repeat(2,minmax(0,1fr))}.filter-actions{justify-content:stretch}.filter-actions>*{flex:1 1 140px}}@media(max-width:650px){.wrap{padding:12px}.top{display:block}.status{margin-top:12px;width:max-content}.cards{grid-template-columns:repeat(2,1fr)}.weather-grid,.sensor-grid{grid-template-columns:1fr}.console-strip{grid-template-columns:repeat(2,1fr)}.filter-source-row,.filter-options-row{grid-template-columns:1fr}.manual-trace-field{grid-column:auto}.footer{display:block}.footer span{display:block;margin-top:5px}.protocol-kpis{grid-template-columns:repeat(2,1fr)}.spark{display:none}}
+.grid{display:grid;grid-template-columns:minmax(0,2.35fr) minmax(300px,.65fr);gap:16px}.grid>*,.side{min-width:0}.table-wrap{overflow:auto;max-height:680px}table{width:100%;border-collapse:collapse;min-width:980px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid rgba(39,52,73,.72);vertical-align:top}th{position:sticky;top:0;background:#131c2d;color:#a8b4c7;font-size:10px;text-transform:uppercase;letter-spacing:.05em;z-index:2}tr:hover td{background:rgba(96,165,250,.045)}td.time{white-space:nowrap;color:#c7d2e2;font-variant-numeric:tabular-nums}td.event{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:700;white-space:nowrap}.badge{display:inline-flex;padding:3px 8px;border-radius:999px;text-transform:uppercase;font-weight:800;font-size:9px;letter-spacing:.04em}.badge.info{background:rgba(96,165,250,.14);color:#93c5fd}.badge.warning{background:rgba(253,176,34,.14);color:#fdb022}.badge.error{background:rgba(249,112,102,.14);color:#fda29b}.badge.critical{background:rgba(238,70,188,.14);color:#f9a8d4}.details{color:#b4c0d0;line-height:1.45;word-break:break-word}.raw summary{cursor:pointer;color:#7ea5df;margin-top:6px}.raw pre{white-space:pre-wrap;word-break:break-all;background:#08101d;padding:9px;border-radius:8px;color:#91a0b5;font-size:11px}.side{display:flex;flex-direction:column;gap:16px}.list{padding:5px 14px 12px}.list-row{display:flex;justify-content:space-between;gap:12px;padding:9px 2px;border-bottom:1px solid rgba(39,52,73,.55)}.list-row:last-child{border-bottom:0}.list-row .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.list-row .count{font-weight:800;font-variant-numeric:tabular-nums}.session{padding:11px 2px;border-bottom:1px solid rgba(39,52,73,.55)}.session:last-child{border-bottom:0}.session strong{display:block}.session small{display:block;color:var(--muted);margin-top:4px;line-height:1.45}.empty{padding:24px;text-align:center;color:var(--muted)}.footer{color:var(--muted);font-size:11px;margin-top:15px;display:flex;gap:14px;justify-content:space-between}
+@media(max-width:1350px){.console-strip{grid-template-columns:repeat(5,1fr)}.cards{grid-template-columns:repeat(4,1fr)}.filter-source-row{grid-template-columns:180px 300px}.filter-source-row.manual-active{grid-template-columns:180px 300px 1fr}.filter-options-row{grid-template-columns:repeat(4,minmax(150px,1fr))}.protocol-grid{grid-template-columns:1fr}.battery-grid,.sensor-grid{grid-template-columns:repeat(3,1fr)}.grid{grid-template-columns:1fr}}@media(max-width:900px){.weather-grid{grid-template-columns:repeat(2,minmax(260px,1fr))}.battery-grid,.sensor-grid{grid-template-columns:repeat(2,1fr)}.console-strip{grid-template-columns:repeat(3,1fr)}}@media(max-width:900px){.filter-source-row{grid-template-columns:1fr 1fr}.manual-trace-field{grid-column:1/-1}.filter-options-row{grid-template-columns:repeat(2,minmax(0,1fr))}.filter-actions{justify-content:stretch}.filter-actions>*{flex:1 1 140px}}@media(max-width:650px){.wrap{padding:12px}.top{display:block}.status{margin-top:12px;width:max-content}.cards{grid-template-columns:repeat(2,1fr)}.weather-grid,.battery-grid,.sensor-grid{grid-template-columns:1fr}.battery-summary{align-items:flex-start}.console-strip{grid-template-columns:repeat(2,1fr)}.filter-source-row,.filter-options-row{grid-template-columns:1fr}.manual-trace-field{grid-column:auto}.footer{display:block}.footer span{display:block;margin-top:5px}.protocol-kpis{grid-template-columns:repeat(2,1fr)}.spark{display:none}}
 
+.battery-summary.partial{color:var(--info)}.battery-summary.partial .battery-summary-icon span{width:65%}
 .forecast-metric{display:grid;grid-template-columns:78px minmax(0,1fr);gap:13px;align-items:center;padding:10px 0;border-bottom:1px solid rgba(39,52,73,.42)}
 .forecast-icon-wrap{width:72px;height:72px;display:flex;align-items:center;justify-content:center;border:1px solid rgba(96,165,250,.22);border-radius:16px;background:rgba(96,165,250,.055)}
 .forecast-svg{width:60px;height:60px;color:#d6e4f7}.forecast-sunny{color:#fdb022}.forecast-partly-cloudy,.forecast-partly-cloudy-night{color:#c8d5e7}.forecast-cloudy{color:#aebbd0}.forecast-rainy{color:#7eb6ff}.forecast-snowy{color:#dcecff}.forecast-clear-night{color:#c4b5fd}.forecast-unknown{color:var(--muted)}
@@ -1485,8 +1721,9 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
     <div id="healthBadge" class="status <?= h($analysis['health']['class']) ?>"><span class="dot"></span><span id="healthLabel"><?= h($analysis['health']['label']) ?></span></div>
   </div>
 
-  <?php if(!$files): ?><div class="panel notice error"><strong>Trace non leggibile.</strong> <?= h($activeTrace) ?> non esiste o non è leggibile dal web server. In modalità AUTO vengono controllati entrambi i trace WMR100 e WMR200.</div><?php endif; ?>
-  <?php if(!empty($source['manual_trace_error'])): ?><div class="panel notice warning"><strong>Trace manuale ignorato.</strong> <?= h((string)$source['manual_trace_error']) ?> È stata usata la sorgente automatica/famiglia selezionata.</div><?php endif; ?>
+  <?php if(!empty($source['manual_trace_error'])): ?><div class="panel notice error"><strong>Trace manuale non disponibile.</strong> <?= h((string)$source['manual_trace_error']) ?> Percorso richiesto: <span class="mono"><?= h($activeTrace) ?></span>.<br>La modalità manuale non crea il file e non usa fallback: verificare nel driver <span class="mono">developer_trace = true</span>, il percorso configurato e i permessi di lettura del web server, oppure selezionare <strong>Automatico</strong>.</div>
+  <?php elseif(!$files&&($source['detection_basis']??'')==='config'): ?><div class="panel notice warning"><strong>Famiglia rilevata dalla configurazione WeeWX: <?= h(strtoupper($analysis['family'])) ?>.</strong> Il file trace configurato <span class="mono"><?= h($activeTrace) ?></span> non esiste o non è leggibile. Configurazione: <span class="mono"><?= h((string)($source['config_path']??'/etc/weewx/weewx.conf')) ?></span><?php if(($source['trace_enabled']??null)===false): ?> · <strong>developer_trace risulta disabilitato</strong><?php endif; ?>.</div>
+  <?php elseif(!$files): ?><div class="panel notice error"><strong>Famiglia e trace non rilevati automaticamente.</strong> La pagina non ha trovato un JSONL accessibile né una configurazione WeeWX leggibile in <span class="mono">/etc/weewx/weewx.conf</span> o <span class="mono">/home/weewx/weewx.conf</span>. Verificare configurazione e permessi del web server.</div><?php endif; ?>
   <?php if($analysis['scan_stopped']): ?><div class="panel notice warning">Analisi interrotta al limite di sicurezza di <?= number_format(MAX_RECORDS_SCANNED,0,',','.') ?> record.</div><?php endif; ?>
   <?php if($analysis['invalid_json']>0): ?><div class="panel notice warning">Rilevate <?= number_format($analysis['invalid_json'],0,',','.') ?> righe JSON non valide.</div><?php endif; ?>
 
@@ -1494,6 +1731,8 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
   <div id="cards" class="cards"><?= render_cards($analysis) ?></div>
 
   <section class="panel weather-panel"><div class="section-head"><h2>Dati meteo live</h2><span>valori WeeWX prodotti dal driver · mini trend ultimi <?= SPARKLINE_POINTS ?> campioni</span></div><div id="weatherGrid" class="weather-grid"><?= render_weather($analysis) ?></div></section>
+
+  <section class="panel battery-panel"><div class="section-head"><h2>Stato batterie</h2><span>0 = regolare · valore diverso da 0 = batteria bassa · console se supportata</span></div><div id="batteryBody"><?= render_batteries($analysis) ?></div></section>
 
   <section id="sensorPanel" class="panel sensor-panel" <?= $analysis['family']==='wmr100'?'':'hidden' ?>><div class="section-head"><h2>Sensori RF / canali</h2><span id="sensorPanelCaption"><?= h($analysis['meta']['model']??'WMR') ?> · solo famiglia WMR100/WMR88 · fino a <?= (int)($analysis['meta']['max_remote_channels']??3) ?> canali</span></div><div id="sensorGrid" class="sensor-grid"><?= $analysis['family']==='wmr100'?render_sensors($analysis):'' ?></div></section>
 
@@ -1517,7 +1756,7 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
           <label><input type="radio" name="trace_mode" value="auto" <?= $traceMode==='auto'?'checked':'' ?>><span>Automatico</span></label>
           <label><input type="radio" name="trace_mode" value="manual" <?= $traceMode==='manual'?'checked':'' ?>><span>Manuale</span></label>
         </div>
-        <div class="source-help">Automatico sceglie il trace attivo più recente. Manuale usa esclusivamente il file indicato. La scelta resta memorizzata anche dopo F5 e riapertura della pagina.</div>
+        <div class="source-help">Automatico sceglie il trace attivo più recente. Manuale usa esclusivamente il file indicato: non lo crea, non abilita il driver e non applica fallback. La scelta resta memorizzata anche dopo F5 e riapertura della pagina.</div>
       </div>
       <div class="field manual-trace-field <?= $traceMode==='manual'?'':'disabled' ?>" id="manualTraceField">
         <label>File trace manuale</label>
@@ -1552,7 +1791,7 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
       <section class="panel"><div class="section-head"><h2>Sessioni recenti</h2></div><div id="sessionsBody" class="list"><?= render_sessions($analysis) ?></div></section>
       <section class="panel"><div class="section-head"><h2>Eventi per tipo</h2></div><div id="eventCountsBody" class="list"><?= render_simple_counts($analysis['event_counts']) ?></div></section>
       <section class="panel"><div class="section-head"><h2>Pacchetti</h2></div><div id="packetCountsBody" class="list"><?= render_simple_counts($analysis['packet_counts']) ?></div></section>
-      <section class="panel"><div class="section-head"><h2>Versioni driver</h2></div><div id="versionsBody" class="list"><?= render_simple_counts($analysis['versions']) ?></div></section>
+      <section class="panel"><div class="section-head"><h2>Versioni driver</h2></div><div id="versionsBody" class="list"><?= render_driver_versions($analysis) ?></div></section>
     </aside>
   </div>
 
@@ -1567,6 +1806,17 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
   const station=document.getElementById('stationModeSelect');
   const form=document.getElementById('traceFilterForm');
   const maxAge=<?= SOURCE_PREF_COOKIE_TTL ?>;
+  const knownTracePaths=[
+    '/var/log/weewx/wmr100-developer-trace.jsonl',
+    '/var/log/weewx/wmr200-developer-trace.jsonl',
+    '/tmp/wmr200-developer-trace.jsonl'
+  ];
+
+  function defaultTracePath(family){
+    return family==='wmr200'
+      ? '/var/log/weewx/wmr200-developer-trace.jsonl'
+      : '/var/log/weewx/wmr100-developer-trace.jsonl';
+  }
 
   function remember(name,value){
     document.cookie=encodeURIComponent(name)+'='+encodeURIComponent(value)+'; Max-Age='+maxAge+'; Path=/; SameSite=Lax';
@@ -1583,13 +1833,18 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
     if(row) row.classList.toggle('manual-active',manual);
     if(input) input.disabled=!manual;
     if(manual && input && !input.value){
-      const family=station?.value||'auto';
-      input.value=family==='wmr200'?'/var/log/weewx/wmr200-developer-trace.jsonl':'/var/log/weewx/wmr100-developer-trace.jsonl';
+      input.value=defaultTracePath(station?.value||'auto');
     }
   }
 
   modeRadios.forEach(r=>r.addEventListener('change',()=>{syncTraceMode();rememberCurrentSource();}));
-  station?.addEventListener('change',()=>{rememberCurrentSource();});
+  station?.addEventListener('change',()=>{
+    const manual=modeRadios.some(r=>r.checked&&r.value==='manual');
+    if(manual && input && (!input.value.trim() || knownTracePaths.includes(input.value.trim()))){
+      input.value=defaultTracePath(station.value||'auto');
+    }
+    rememberCurrentSource();
+  });
   input?.addEventListener('change',rememberCurrentSource);
   input?.addEventListener('blur',rememberCurrentSource);
   form?.addEventListener('submit',rememberCurrentSource);
@@ -1613,6 +1868,7 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
       if(h.console!==undefined) document.getElementById('consoleStrip').innerHTML=h.console;
       if(h.cards!==undefined) document.getElementById('cards').innerHTML=h.cards;
       if(h.weather!==undefined) document.getElementById('weatherGrid').innerHTML=h.weather;
+      if(h.batteries!==undefined) document.getElementById('batteryBody').innerHTML=h.batteries;
       const sensorPanel=document.getElementById('sensorPanel');
       if(sensorPanel) sensorPanel.hidden=!d.show_sensors;
       if(d.show_sensors && h.sensors!==undefined){const sg=document.getElementById('sensorGrid');if(sg)sg.innerHTML=h.sensors;const sc=document.getElementById('sensorPanelCaption');if(sc)sc.textContent=(d.model||'WMR')+' · solo famiglia WMR100/WMR88 · fino a '+(d.max_remote_channels||3)+' canali';}
