@@ -1,4 +1,4 @@
-# WMR Universal Developer Trace Dashboard v2.9
+# WMR Universal Developer Trace Dashboard v2.9.1
 
 [![Validate](https://github.com/pgpaolo/weewx-wmr-developer-trace-dashboard/actions/workflows/validate.yml/badge.svg)](https://github.com/pgpaolo/weewx-wmr-developer-trace-dashboard/actions/workflows/validate.yml)
 
@@ -18,7 +18,7 @@ La dashboard legge i developer trace JSONL strutturati prodotti dai driver harde
 
 ## Versione corrente
 
-**v2.9**
+**v2.9.1**
 
 La v2.9 introduce la diagnostica universale dei termoigrometri multicanale senza modificare la logica hardened USB/recovery:
 
@@ -85,6 +85,10 @@ Sono gestiti:
 - pannelli specifici per famiglia.
 
 Il pannello RF/termoigrometri viene mostrato per entrambe le famiglie. WMR100/WMR88 rispetta il limite di canali configurato; WMR200/WMR200A supporta in diagnostica CH0–CH10.
+
+Per impostazione predefinita il pannello mostra soltanto i canali che hanno realmente ricevuto temperatura o umidità. Il comando **Mostra non ricevuti** consente di visualizzare temporaneamente anche i canali assenti/non utilizzati per finalità diagnostiche; la preferenza viene mantenuta nel browser.
+
+Su WMR200/WMR200A lo stato batteria è disponibile come `outTempBatteryStatus` soltanto per il termoigrometro esterno principale. Per i canali T/H aggiuntivi viene quindi mostrato **N/D per canale**, evitando di attribuire uno stato batteria non identificabile dal protocollo.
 
 ## Pressione e previsione
 
