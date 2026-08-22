@@ -1,6 +1,6 @@
 <?php
 /**
- * Oregon Scientific WMR Universal Developer Trace Dashboard v2.8.1
+ * Oregon Scientific WMR Universal Developer Trace Dashboard v2.9.1
  *
  * Standalone diagnostics dashboard for the hardened WeeWX drivers:
  *   - WMR100 protocol family: WMR100/WMR100N, WMR88/WMR88A, WMR180/A, WMRS200
@@ -51,11 +51,12 @@ const MAX_RECORDS_SCANNED = 250000;
 const DEFAULT_DISPLAY_LIMIT = 250;
 const MAX_DISPLAY_LIMIT = 2000;
 const LOCAL_TIMEZONE = 'Europe/Rome';
-const PAGE_TITLE = 'Oregon Scientific WMR Developer Trace v2.8.1';
+const DASHBOARD_VERSION = '2.9.1';
+const PAGE_TITLE = 'Oregon Scientific WMR Developer Trace v2.9.1';
 const RECENT_HEALTH_WINDOW = 600;
 const DEFAULT_LIVE_REFRESH = 5;
 const API_TAIL_LINES = 6000; // retained only for detection/backward compatibility
-const LIVE_CACHE_VERSION = 5;
+const LIVE_CACHE_VERSION = 6;
 const LIVE_CACHE_ROOT = '/tmp';
 const DETECTION_TAIL_LINES = 8000;
 const DIAGNOSTIC_TAIL_LINES = 5000;
@@ -768,6 +769,7 @@ function common_field_from_wmr200(string $key): string
     if(preg_match('/^temperature_(\d+)$/',$key,$m))return channel_field((int)$m[1],'temp');
     if(preg_match('/^humidity_(\d+)$/',$key,$m))return channel_field((int)$m[1],'hum');
     if(preg_match('/^heatindex_(\d+)$/',$key,$m))return channel_field((int)$m[1],'heat');
+    if(preg_match('/^battery_status_(\d+)$/',$key,$m))return channel_field((int)$m[1],'battery');
     return $key;
 }
 
@@ -781,6 +783,9 @@ function channel_field(int $ch, string $kind): string
     }
     if($kind==='heat'){
         if($ch===0)return 'inHeatindex'; if($ch===1)return 'heatindex'; if($ch<=8)return 'heatindex'.($ch-1); return 'channelHeatindex'.$ch;
+    }
+    if($kind==='battery'){
+        if($ch===0)return 'inTempBatteryStatus'; if($ch===1)return 'outTempBatteryStatus'; if($ch<=8)return 'extraBatteryStatus'.($ch-1); return 'channelBattery'.$ch;
     }
     return $kind.$ch;
 }
@@ -968,7 +973,7 @@ function new_analysis_state(array $source): array
         'driver_version'=>$source['version']?:'sconosciuta',
         'model'=>$source['model']?:family_title($source['family']),
         'model_profile'=>$source['family']==='wmr200'?'wmr200':'',
-        'max_remote_channels'=>$source['family']==='wmr200'?0:3,
+        'max_remote_channels'=>$source['family']==='wmr200'?10:3,
         'timeout_warning_threshold'=>$source['family']==='wmr200'?2:8,
         'timeout_error_threshold'=>$source['family']==='wmr200'?4:20,
         'timeout_reinit_threshold'=>$source['family']==='wmr200'?0:12,
@@ -1096,7 +1101,7 @@ function start_session(array &$a, array $data, ?string $timestamp): void
         $a['meta']=array_merge($a['meta'],[
             'driver'=>(string)($data['driver']??'WMR200'),'driver_version'=>$version,'model'=>(string)($data['model']??'WMR200'),
             'model_profile'=>'wmr200','archive_interval'=>$data['archive_interval']??null,'erase_archive'=>$data['erase_archive']??null,
-            'max_remote_channels'=>0,'timeout_warning_threshold'=>2,'timeout_error_threshold'=>4,
+            'max_remote_channels'=>10,'timeout_warning_threshold'=>2,'timeout_error_threshold'=>4,
         ]);
     }else{
         $version=(string)($data['driver_version']??$data['version']??'sconosciuta');
@@ -1504,6 +1509,29 @@ function sensor_channel_definition(int $ch): array
     return ['name'=>'CH'.$ch.' · Sensore remoto','temp'=>'channelTemp'.$ch,'hum'=>'channelHumid'.$ch,'battery'=>'channelBattery'.$ch];
 }
 
+function sensor_channel_limit(array $a): int
+{
+    $default=$a['family']==='wmr200'?10:3;
+    $configured=(int)($a['meta']['max_remote_channels']??$default);
+    if($configured<=0)$configured=$default;
+    $hardMax=$a['family']==='wmr200'?10:8;
+    return max(1,min($hardMax,$configured));
+}
+
+function sensor_panel_caption(array $a): string
+{
+    $model=trim((string)($a['meta']['model']??family_title($a['family'])));
+    if($model==='')$model=family_title($a['family']);
+    $familyLabel=$a['family']==='wmr200'?'WMR200/WMR200A':'WMR100/WMR88';
+    return $model.' · termoigrometri '.$familyLabel.' · CH0–CH'.sensor_channel_limit($a);
+}
+
+function sensor_native_mapping(int $ch,string $family): string
+{
+    if($family==='wmr200')return 'temperature_'.$ch.' / humidity_'.$ch;
+    return 'frame T/H CH'.$ch;
+}
+
 function battery_definitions(array $a): array
 {
     $definitions = [];
@@ -1574,12 +1602,25 @@ function render_batteries(array $a): string
 
 function render_sensors(array $a): string
 {
-    if($a['family']!=='wmr100')return '';
-    $max=(int)($a['meta']['max_remote_channels']??($a['family']==='wmr200'?10:3));$max=max(1,min(10,$max));ob_start();
-    for($ch=0;$ch<=$max;$ch++){$d=sensor_channel_definition($ch);$t=reading($a,$d['temp']);$hu=reading($a,$d['hum']);$bat=reading($a,$d['battery']);$ages=[];foreach([$t,$hu] as $r)if($r&&isset($r['epoch'])&&$r['epoch']!==null)$ages[]=max(0,microtime(true)-(float)$r['epoch']);$age=$ages?min($ages):null;[$cls,$label]=packet_freshness('temperature_humidity',$age,null,$a['family'],(string)($a['meta']['model']??''));if(!$t&&!$hu){$cls='missing';$label='Non ricevuto';}?>
-      <article class="sensor-card <?=h($cls)?>"><div class="sensor-head"><strong><?=h($d['name'])?></strong><span class="freshness <?=h($cls)?>"><?=h($label)?></span></div><div class="sensor-body"><div><span>Temperatura</span><b><?=h($t?weather_value($d['temp'],$t['value'],$a['family']):'N/A')?></b></div><div><span>Umidità</span><b><?=h($hu?weather_value($d['hum'],$hu['value'],$a['family']):'N/A')?></b></div><div><span>Batteria</span><b><?=h($bat?weather_value($d['battery'],$bat['value'],$a['family']):'N/A')?></b></div><div><span>Età</span><b><?=h(format_age($age))?></b></div></div></article><?php }
-    $special=[['Vento','wind','windSpeed','windBatteryStatus'],['Pioggia','rain','rainTotal','rainBatteryStatus'],['UV','uv','UV','uvBatteryStatus']];foreach($special as [$name,$packet,$field,$battery]){$r=reading($a,$field);$b=reading($a,$battery);$age=$a['packet_timing'][$packet]['age']??null;[$cls,$label]=packet_freshness($packet,$age,$a['packet_timing'][$packet]['average_interval']??null,$a['family'],(string)($a['meta']['model']??''));?>
-      <article class="sensor-card <?=h($cls)?>"><div class="sensor-head"><strong><?=h($name)?></strong><span class="freshness <?=h($cls)?>"><?=h($label)?></span></div><div class="sensor-body"><div><span>Valore</span><b><?=h($r?weather_value($field,$r['value'],$a['family']):'N/A')?></b></div><div><span>Batteria</span><b><?=h($b?weather_value($battery,$b['value'],$a['family']):'N/A')?></b></div><div><span>Ultimo pacchetto</span><b><?=h(format_age($age))?></b></div><div><span>Ricezioni</span><b><?=number_format((int)($a['packet_timing'][$packet]['count']??0),0,',','.')?></b></div></div></article><?php }return(string)ob_get_clean();
+    $max=sensor_channel_limit($a);ob_start();
+    for($ch=0;$ch<=$max;$ch++){
+        $d=sensor_channel_definition($ch);$t=reading($a,$d['temp']);$hu=reading($a,$d['hum']);$bat=reading($a,$d['battery']);
+        $ages=[];foreach([$t,$hu] as $r)if($r&&isset($r['epoch'])&&$r['epoch']!==null)$ages[]=max(0,microtime(true)-(float)$r['epoch']);
+        $age=$ages?max($ages):null;
+        [$cls,$label]=packet_freshness('temperature_humidity',$age,null,$a['family'],(string)($a['meta']['model']??''));
+        if(!$t&&!$hu){$cls='missing';$label='Non ricevuto';}
+        [$batteryClass,$batteryLabel]=battery_state($bat['value']??null);
+        $batteryDisplay=$bat?$batteryLabel:(($a['family']==='wmr200'&&$ch>=2)?'N/D per canale':'N/A');
+        $lastTimestamp=$t['timestamp']??($hu['timestamp']??null);
+        $weewxMap=$d['temp'].' / '.$d['hum'];
+        $nativeMap=sensor_native_mapping($ch,$a['family']);?>
+      <article class="sensor-card channel-card <?=h($cls)?><?=(!$t&&!$hu)?' channel-missing':''?>"><div class="sensor-head"><strong><?=h($d['name'])?></strong><span class="freshness <?=h($cls)?>"><?=h($label)?></span></div><div class="sensor-body"><div><span>Temperatura</span><b><?=h($t?weather_value($d['temp'],$t['value'],$a['family']):'N/A')?></b></div><div><span>Umidità</span><b><?=h($hu?weather_value($d['hum'],$hu['value'],$a['family']):'N/A')?></b></div><div><span>Batteria</span><b class="<?=h($batteryClass==='low'?'warning':($batteryClass==='ok'?'ok':'muted'))?>"><?=h($batteryDisplay)?></b></div><div><span>Età</span><b><?=h(format_age($age))?></b></div><div><span>Ultima lettura</span><b><?=h($lastTimestamp?local_timestamp($lastTimestamp,false):'—')?></b></div><div class="sensor-map"><span>Mapping</span><code>WeeWX: <?=h($weewxMap)?></code><?php if($a['family']==='wmr200'):?><code>Nativo: <?=h($nativeMap)?></code><?php endif;?></div></div></article><?php
+    }
+    $special=[['Vento','wind','windSpeed','windBatteryStatus'],['Pioggia','rain','rainTotal','rainBatteryStatus'],['UV','uv','UV','uvBatteryStatus']];
+    foreach($special as [$name,$packet,$field,$battery]){$r=reading($a,$field);$b=reading($a,$battery);$age=$a['packet_timing'][$packet]['age']??null;[$cls,$label]=packet_freshness($packet,$age,$a['packet_timing'][$packet]['average_interval']??null,$a['family'],(string)($a['meta']['model']??''));?>
+      <article class="sensor-card <?=h($cls)?>"><div class="sensor-head"><strong><?=h($name)?></strong><span class="freshness <?=h($cls)?>"><?=h($label)?></span></div><div class="sensor-body"><div><span>Valore</span><b><?=h($r?weather_value($field,$r['value'],$a['family']):'N/A')?></b></div><div><span>Batteria</span><b><?=h($b?weather_value($battery,$b['value'],$a['family']):'N/A')?></b></div><div><span>Ultimo pacchetto</span><b><?=h(format_age($age))?></b></div><div><span>Ricezioni</span><b><?=number_format((int)($a['packet_timing'][$packet]['count']??0),0,',','.')?></b></div></div></article><?php
+    }
+    return(string)ob_get_clean();
 }
 
 function render_protocol(array $a): string
@@ -1632,7 +1673,21 @@ function render_driver_versions(array $a): string
 }
 
 function api_payload(array $a): array
-{return ['generated'=>(new DateTimeImmutable('now',new DateTimeZone(LOCAL_TIMEZONE)))->format('d/m/Y H:i:s T'),'family'=>$a['family'],'family_title'=>family_title($a['family']),'source'=>$a['source']['path'],'health'=>$a['health'],'last_rx_age'=>$a['last_rx_age'],'last_sequence'=>max(array_map('intval',array_column($a['rows'],'sequence'))?:[0]),'show_sensors'=>$a['family']==='wmr100','model'=>(string)($a['meta']['model']??'WMR'),'max_remote_channels'=>(int)($a['meta']['max_remote_channels']??0),'html'=>['console'=>render_console_strip($a),'cards'=>render_cards($a),'weather'=>render_weather($a),'batteries'=>render_batteries($a),'sensors'=>$a['family']==='wmr100'?render_sensors($a):'','protocol'=>render_protocol($a),'timeline'=>render_timeline($a),'events'=>render_event_rows($a),'sessions'=>render_sessions($a),'event_counts'=>render_simple_counts($a['event_counts']),'packet_counts'=>render_simple_counts($a['packet_counts']),'versions'=>render_driver_versions($a)]];}
+{
+    return [
+        'generated'=>(new DateTimeImmutable('now',new DateTimeZone(LOCAL_TIMEZONE)))->format('d/m/Y H:i:s T'),
+        'family'=>$a['family'],'family_title'=>family_title($a['family']),'source'=>$a['source']['path'],'health'=>$a['health'],
+        'last_rx_age'=>$a['last_rx_age'],'last_sequence'=>max(array_map('intval',array_column($a['rows'],'sequence'))?:[0]),
+        'show_sensors'=>true,'sensor_caption'=>sensor_panel_caption($a),'model'=>(string)($a['meta']['model']??'WMR'),
+        'max_remote_channels'=>sensor_channel_limit($a),
+        'html'=>[
+            'console'=>render_console_strip($a),'cards'=>render_cards($a),'weather'=>render_weather($a),'batteries'=>render_batteries($a),
+            'sensors'=>render_sensors($a),'protocol'=>render_protocol($a),'timeline'=>render_timeline($a),'events'=>render_event_rows($a),
+            'sessions'=>render_sessions($a),'event_counts'=>render_simple_counts($a['event_counts']),'packet_counts'=>render_simple_counts($a['packet_counts']),
+            'versions'=>render_driver_versions($a)
+        ]
+    ];
+}
 
 // -----------------------------------------------------------------------------
 // Diagnostic bundle
@@ -1699,7 +1754,12 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
 .cards{display:grid;grid-template-columns:repeat(8,minmax(130px,1fr));gap:12px;margin-bottom:16px}.card{padding:14px 15px;min-height:94px}.card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}.card .value{font-size:26px;font-weight:800;margin-top:9px}.card .sub{color:var(--muted);margin-top:4px;font-size:11px;line-height:1.35}
 .section-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:15px 16px;border-bottom:1px solid var(--border)}.section-head h2{font-size:16px;margin:0}.section-head span{color:var(--muted);font-size:12px}.weather-panel,.battery-panel,.sensor-panel,.protocol-panel,.timeline-panel{margin-bottom:16px;overflow:hidden}.weather-grid{display:grid;grid-template-columns:repeat(3,minmax(280px,1fr));gap:12px;padding:14px}.weather-card,.sensor-card{background:rgba(8,16,29,.52);border:1px solid var(--border);border-radius:14px;overflow:hidden}.weather-card.fresh,.sensor-card.fresh{border-color:rgba(50,213,131,.38)}.weather-card.delayed,.sensor-card.delayed{border-color:rgba(253,176,34,.48)}.weather-card.stale,.weather-card.missing,.sensor-card.stale,.sensor-card.missing{border-color:rgba(249,112,102,.48)}.weather-head,.sensor-head{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 13px;border-bottom:1px solid rgba(39,52,73,.7)}.weather-head h3{font-size:14px;margin:0}.weather-head-right{display:flex;align-items:center;gap:10px}.spark{width:116px;height:30px;color:#7ea5df;opacity:.9}.freshness{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.04em;border-radius:999px;padding:4px 8px;white-space:nowrap}.freshness.fresh{background:rgba(50,213,131,.14);color:var(--ok)}.freshness.delayed{background:rgba(253,176,34,.14);color:var(--warn)}.freshness.stale,.freshness.missing{background:rgba(249,112,102,.14);color:var(--error)}.metrics{padding:5px 13px}.metric{display:grid;grid-template-columns:minmax(130px,1fr) auto;gap:12px;padding:7px 0;border-bottom:1px solid rgba(39,52,73,.42)}.metric:last-child{border-bottom:0}.metric-name{color:#aebbd0}.metric-value{text-align:right;font-weight:800;font-variant-numeric:tabular-nums}.metric-age{grid-column:1/-1;text-align:right;color:var(--muted);font-size:10px;margin-top:-5px}.weather-foot{padding:10px 13px;background:rgba(23,32,51,.5);color:var(--muted);font-size:11px;line-height:1.55}
 .battery-summary{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:12px 16px;border-bottom:1px solid var(--border);background:rgba(96,165,250,.055)}.battery-summary>div{display:flex;align-items:center;gap:10px}.battery-summary>span{color:var(--muted);font-size:11px}.battery-summary-icon,.battery-visual{position:relative;display:inline-flex;border:2px solid currentColor;border-radius:4px}.battery-summary-icon{width:27px;height:14px}.battery-summary-icon:after,.battery-visual:after{content:"";position:absolute;right:-5px;top:25%;width:3px;height:50%;border-radius:0 2px 2px 0;background:currentColor}.battery-summary-icon span,.battery-visual span{display:block;margin:2px;background:currentColor;border-radius:1px}.battery-summary.all-ok{color:var(--ok)}.battery-summary.has-low{color:var(--warn)}.battery-summary.unknown{color:var(--muted)}.battery-summary.all-ok .battery-summary-icon span{width:100%}.battery-summary.has-low .battery-summary-icon span{width:28%}.battery-summary.unknown .battery-summary-icon span{width:0}.battery-grid{display:grid;grid-template-columns:repeat(4,minmax(210px,1fr));gap:12px;padding:14px}.battery-card{display:grid;grid-template-columns:42px minmax(0,1fr);gap:12px;align-items:center;min-height:86px;padding:12px;background:rgba(8,16,29,.52);border:1px solid var(--border);border-radius:14px}.battery-card.ok{color:var(--ok);border-color:rgba(50,213,131,.38)}.battery-card.low{color:var(--warn);border-color:rgba(253,176,34,.55);background:rgba(253,176,34,.055)}.battery-card.unknown{color:var(--muted)}.battery-visual{width:36px;height:20px}.battery-card.ok .battery-visual span{width:100%}.battery-card.low .battery-visual span{width:25%}.battery-card.unknown .battery-visual span{width:0}.battery-copy{min-width:0}.battery-copy strong,.battery-copy span,.battery-copy small{display:block}.battery-copy strong{color:var(--text);font-size:12px}.battery-copy span{margin-top:3px;font-size:12px;font-weight:800}.battery-copy small{margin-top:5px;color:var(--muted);font-size:9px;line-height:1.35}
-.sensor-grid{display:grid;grid-template-columns:repeat(4,minmax(230px,1fr));gap:12px;padding:14px}.sensor-head strong{font-size:13px}.sensor-body{padding:8px 12px}.sensor-body>div{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid rgba(39,52,73,.42)}.sensor-body>div:last-child{border-bottom:0}.sensor-body span{color:var(--muted);font-size:11px}.sensor-body b{font-size:12px;text-align:right}
+.sensor-grid{display:grid;grid-template-columns:repeat(4,minmax(230px,1fr));gap:12px;padding:14px}.sensor-head strong{font-size:13px}.sensor-body{padding:8px 12px}.sensor-body>div{display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid rgba(39,52,73,.42)}.sensor-body>div:last-child{border-bottom:0}.sensor-body span{color:var(--muted);font-size:11px}.sensor-body b{font-size:12px;text-align:right}.sensor-map{display:block!important;padding-top:8px!important}.sensor-map span{display:block;margin-bottom:5px}.sensor-map code{display:block;color:#b8c6d9;font-size:9px;line-height:1.45;word-break:break-word}.sensor-map code+code{margin-top:2px}
+.sensor-panel:not(.show-inactive) .sensor-card.channel-missing{display:none}
+.sensor-head-tools{display:flex;align-items:center;justify-content:flex-end;gap:14px;flex-wrap:wrap}
+.sensor-visibility-toggle{display:inline-flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;white-space:nowrap;cursor:pointer;user-select:none}
+.sensor-visibility-toggle input{accent-color:var(--info)}
+.footer-version{margin-left:auto;font-weight:800;color:#93c5fd;white-space:nowrap}
 .protocol-grid{display:grid;grid-template-columns:minmax(420px,.9fr) minmax(460px,1.1fr);gap:14px;padding:14px}.protocol-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.protocol-kpis>div{background:rgba(8,16,29,.52);border:1px solid var(--border);border-radius:12px;padding:12px}.protocol-kpis span{display:block;color:var(--muted);font-size:10px;text-transform:uppercase}.protocol-kpis b{display:block;font-size:22px;margin-top:8px}.protocol-detail{background:rgba(8,16,29,.52);border:1px solid var(--border);border-radius:12px;padding:14px}.protocol-detail h3{margin:0 0 8px;font-size:14px}.protocol-detail p{color:var(--muted);line-height:1.55}.anomaly{border-top:1px solid var(--border);padding-top:10px}.anomaly small{display:block;color:var(--muted);margin:4px 0 8px}.anomaly code,.candidate code{display:block;background:#07101d;border:1px solid var(--border);border-radius:8px;padding:8px;word-break:break-all;color:#bdc9da;margin-top:6px}.candidate{margin-top:10px;padding:10px;border-radius:9px;background:rgba(96,165,250,.08);color:#c9d8ee;line-height:1.5}
 .timeline-list{padding:8px 14px 14px}.timeline-row{position:relative;display:grid;grid-template-columns:16px 1fr;gap:10px;padding:9px 0;border-bottom:1px solid rgba(39,52,73,.5)}.timeline-row:last-child{border-bottom:0}.timeline-dot{width:9px;height:9px;border-radius:50%;margin-top:5px;background:var(--info)}.timeline-dot.warning{background:var(--warn)}.timeline-dot.error{background:var(--error)}.timeline-dot.critical{background:var(--critical)}.timeline-row strong{font-size:12px}.timeline-row small{display:block;color:var(--muted);font-size:10px;margin-top:2px}.timeline-row p{margin:4px 0 0;color:#aab7c8;font-size:11px;line-height:1.4;word-break:break-word}
 .filters{padding:14px;margin-bottom:16px}.filters form{display:block}.filter-source-row{display:grid;grid-template-columns:190px minmax(290px,420px);gap:12px;align-items:end;padding-bottom:13px;margin-bottom:13px;border-bottom:1px solid rgba(39,52,73,.72)}.filter-options-row{display:grid;grid-template-columns:auto auto 150px minmax(170px,1fr) minmax(170px,1fr) 95px 105px auto;gap:10px;align-items:end}.filter-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px;justify-content:flex-end}.field label{display:block;color:var(--muted);font-size:11px;margin:0 0 6px}.field input,.field select{width:100%;height:38px;border-radius:9px;border:1px solid var(--border);background:#0c1424;color:var(--text);padding:0 10px}.check{height:38px;display:flex;align-items:center;gap:8px;color:var(--muted);white-space:nowrap}.check input{accent-color:var(--info)}button,.button{height:38px;border:0;border-radius:9px;padding:0 14px;background:#2563eb;color:white;font-weight:700;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap}.button.secondary{background:#253047;color:var(--text);border:1px solid var(--border)}.button.green{background:#087a55}.live-indicator{display:inline-flex;align-items:center;gap:5px;color:var(--muted)}.live-led{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok)}.live-led.off{background:#64748b;box-shadow:none}.live-led.error{background:var(--error);box-shadow:0 0 8px var(--error)}.source-switch{display:grid;grid-template-columns:1fr 1fr;height:38px;border:1px solid var(--border);border-radius:10px;overflow:hidden;background:#0c1424}.source-switch label{position:relative;margin:0;cursor:pointer}.source-switch input{position:absolute;opacity:0;pointer-events:none}.source-switch span{height:100%;display:flex;align-items:center;justify-content:center;padding:0 14px;color:var(--muted);font-weight:800;transition:.15s ease}.source-switch label+label span{border-left:1px solid var(--border)}.source-switch input:checked+span{background:#2563eb;color:#fff;box-shadow:inset 0 0 0 1px rgba(255,255,255,.08)}.filter-source-row.manual-active{grid-template-columns:190px minmax(290px,420px) minmax(330px,1fr)}.manual-trace-field{transition:opacity .15s ease}.manual-trace-field.disabled{display:none}.source-help{margin-top:6px;color:var(--muted);font-size:11px;line-height:1.35}
@@ -1734,7 +1794,7 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
 
   <section class="panel battery-panel"><div class="section-head"><h2>Stato batterie</h2><span>0 = regolare · valore diverso da 0 = batteria bassa · console se supportata</span></div><div id="batteryBody"><?= render_batteries($analysis) ?></div></section>
 
-  <section id="sensorPanel" class="panel sensor-panel" <?= $analysis['family']==='wmr100'?'':'hidden' ?>><div class="section-head"><h2>Sensori RF / canali</h2><span id="sensorPanelCaption"><?= h($analysis['meta']['model']??'WMR') ?> · solo famiglia WMR100/WMR88 · fino a <?= (int)($analysis['meta']['max_remote_channels']??3) ?> canali</span></div><div id="sensorGrid" class="sensor-grid"><?= $analysis['family']==='wmr100'?render_sensors($analysis):'' ?></div></section>
+  <section id="sensorPanel" class="panel sensor-panel"><div class="section-head"><h2>Sensori RF / canali termoigrometrici</h2><div class="sensor-head-tools"><span id="sensorPanelCaption"><?= h(sensor_panel_caption($analysis)) ?></span><label class="sensor-visibility-toggle"><input type="checkbox" id="showInactiveSensors"> Mostra non ricevuti</label></div></div><div id="sensorGrid" class="sensor-grid"><?= render_sensors($analysis) ?></div></section>
 
   <section class="panel protocol-panel"><div class="section-head"><h2>Protocol Monitor</h2><span><?= $analysis['family']==='wmr100' ? 'FF FF framing · checksum · lunghezze · resync' : 'command/length framing · checksum · stream resync' ?></span></div><div id="protocolBody"><?= render_protocol($analysis) ?></div></section>
 
@@ -1795,7 +1855,7 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
     </aside>
   </div>
 
-  <div class="footer"><span>Sorgente: <?= h(strtoupper($analysis['family'])) ?> <?= ($analysis['source']['manual_trace']??false)?'(trace manuale)':(($analysis['source']['auto_detected']??false)?'(auto)':'(famiglia manuale)') ?> · <?= h($activeTrace) ?></span><span>Periodo: <?= h(local_timestamp($analysis['first_timestamp'],false)) ?> → <?= h(local_timestamp($analysis['last_timestamp'],false)) ?></span><span>Health corrente: <?= h($analysis['health']['reason']) ?></span><span id="generatedAt">Generato: <?= h((new DateTimeImmutable('now',new DateTimeZone(LOCAL_TIMEZONE)))->format('d/m/Y H:i:s T')) ?></span></div>
+  <div class="footer"><span>Sorgente: <?= h(strtoupper($analysis['family'])) ?> <?= ($analysis['source']['manual_trace']??false)?'(trace manuale)':(($analysis['source']['auto_detected']??false)?'(auto)':'(famiglia manuale)') ?> · <?= h($activeTrace) ?></span><span>Periodo: <?= h(local_timestamp($analysis['first_timestamp'],false)) ?> → <?= h(local_timestamp($analysis['last_timestamp'],false)) ?></span><span>Health corrente: <?= h($analysis['health']['reason']) ?></span><span id="generatedAt">Generato: <?= h((new DateTimeImmutable('now',new DateTimeZone(LOCAL_TIMEZONE)))->format('d/m/Y H:i:s T')) ?></span><span class="footer-version">Dashboard v<?= h(DASHBOARD_VERSION) ?></span></div>
 </div>
 <script>
 (() => {
@@ -1851,6 +1911,19 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
   syncTraceMode();
 })();
 (() => {
+  const panel=document.getElementById('sensorPanel');
+  const toggle=document.getElementById('showInactiveSensors');
+  if(!panel||!toggle)return;
+  const key='wmr_show_inactive_sensors';
+  try{toggle.checked=localStorage.getItem(key)==='1';}catch(e){toggle.checked=false;}
+  const apply=()=>{
+    panel.classList.toggle('show-inactive',toggle.checked);
+    try{localStorage.setItem(key,toggle.checked?'1':'0');}catch(e){}
+  };
+  toggle.addEventListener('change',apply);
+  apply();
+})();
+(() => {
   const interval = <?= (int)$liveRefresh ?>;
   if (!interval) return;
   const params = new URLSearchParams(window.location.search);
@@ -1871,7 +1944,7 @@ if(!$includeRotated&&count($files)===1){$rawAnalysis=analyse_trace_raw($source,$
       if(h.batteries!==undefined) document.getElementById('batteryBody').innerHTML=h.batteries;
       const sensorPanel=document.getElementById('sensorPanel');
       if(sensorPanel) sensorPanel.hidden=!d.show_sensors;
-      if(d.show_sensors && h.sensors!==undefined){const sg=document.getElementById('sensorGrid');if(sg)sg.innerHTML=h.sensors;const sc=document.getElementById('sensorPanelCaption');if(sc)sc.textContent=(d.model||'WMR')+' · solo famiglia WMR100/WMR88 · fino a '+(d.max_remote_channels||3)+' canali';}
+      if(d.show_sensors && h.sensors!==undefined){const sg=document.getElementById('sensorGrid');if(sg)sg.innerHTML=h.sensors;const sc=document.getElementById('sensorPanelCaption');if(sc)sc.textContent=d.sensor_caption||((d.model||'WMR')+' · canali termoigrometrici CH0–CH'+(d.max_remote_channels||3));}
       if(h.protocol!==undefined) document.getElementById('protocolBody').innerHTML=h.protocol;
       if(h.timeline!==undefined) document.getElementById('timelineBody').innerHTML=h.timeline;
       if(h.events!==undefined) document.getElementById('eventsBody').innerHTML=h.events;

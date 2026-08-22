@@ -2,6 +2,42 @@
 
 All notable changes to the WMR Universal Developer Trace Dashboard are documented here.
 
+## v2.9.1 — 2026-08-22
+
+### Changed
+
+- The thermo-hygrometer panel now shows only channels that have actually received temperature or humidity data by default.
+- Added a **Show not received** control to reveal missing/unused channels when full RF diagnostics are required.
+- The channel-visibility preference is retained in browser local storage and survives AJAX refreshes.
+- Wind, rain and UV diagnostic cards remain visible independently of the thermo-hygrometer channel filter.
+- Added the dashboard version indicator to the bottom-right footer.
+- WMR200 additional T/H channels now show `N/D per canale` for battery state because the console protocol does not identify a battery status for CH2+; CH1 continues to use the real `outTempBatteryStatus` value.
+
+## v2.9 — 2026-08-22
+
+### Added
+
+- Added universal thermo-hygrometer channel diagnostics for WMR100/WMR88 and WMR200/WMR200A.
+- Added WMR200/WMR200A diagnostic channel coverage from CH0 through CH10.
+- Added per-channel temperature, humidity, battery state when available, data age and last-reading timestamp.
+- Added explicit WeeWX field mapping to each channel card.
+- Added native WMR200 `temperature_N` / `humidity_N` labels to the channel cards.
+- Added forward-compatible `battery_status_N` mapping for channel-specific battery observations when present in the trace.
+
+### Changed
+
+- The RF/channel panel is no longer hidden for WMR200/WMR200A.
+- WMR100/WMR88 continues to respect `max_remote_channels`; WMR200 defaults to ten remote channels for diagnostics.
+- WMR200 channel metadata remains consistent across `driver_start` session resets.
+- Updated the AJAX payload and caption handling for the universal channel panel.
+- Incremented the live-cache schema to version 6.
+
+### Compatibility
+
+- Existing USB, recovery, forecast, pressure and protocol-monitor logic is unchanged.
+- Standard WeeWX mappings remain unchanged: CH1 = `outTemp` / `outHumidity`, CH2 = `extraTemp1` / `extraHumid1`, CH3 = `extraTemp2` / `extraHumid2`, through CH8.
+- WMR200 CH9 and CH10 remain visible diagnostically through generic channel fields unless explicitly mapped by the driver/schema.
+
 ## v2.8 — 2026-08-09
 
 ### Changed
