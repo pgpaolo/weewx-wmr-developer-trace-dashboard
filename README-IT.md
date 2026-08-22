@@ -1,4 +1,4 @@
-# WMR Universal Developer Trace Dashboard v2.8
+# WMR Universal Developer Trace Dashboard v2.9
 
 [![Validate](https://github.com/pgpaolo/weewx-wmr-developer-trace-dashboard/actions/workflows/validate.yml/badge.svg)](https://github.com/pgpaolo/weewx-wmr-developer-trace-dashboard/actions/workflows/validate.yml)
 
@@ -18,16 +18,19 @@ La dashboard legge i developer trace JSONL strutturati prodotti dai driver harde
 
 ## Versione corrente
 
-**v2.8**
+**v2.9**
 
-La v2.8 mantiene invariato il comportamento WMR200 e migliora l'interpretazione di pressione e previsione per WMR100/WMR88:
+La v2.9 introduce la diagnostica universale dei termoigrometri multicanale senza modificare la logica hardened USB/recovery:
 
-- supporto nativo a `forecastIcon` quando fornito dai driver hardened WMR100/WMR88 più recenti;
-- fallback verificato al pacchetto pressione raw `0x46` per trace compatibili più vecchi;
-- visualizzazione separata di pressione stazione/assoluta e pressione relativa console / SLP;
-- la pressione relativa WMR100/WMR88 non viene più indicata impropriamente come `altimeter`;
-- WMR200 continua a usare il valore `altimeter` fornito dal proprio driver;
-- schema live-cache portato alla versione 5 per evitare stato obsoleto ereditato dalla v2.7.
+- le schede RF/termoigrometri sono disponibili sia per WMR100/WMR88 sia per WMR200/WMR200A;
+- WMR100/WMR88 continua a rispettare il limite di canali remoti configurato;
+- WMR200/WMR200A supporta in diagnostica i canali da CH0 a CH10;
+- ogni canale mostra temperatura, umidità, stato batteria quando disponibile, età del dato, ultima lettura e mapping WeeWX;
+- per WMR200 vengono mostrati anche i nomi nativi `temperature_N` / `humidity_N`;
+- è supportato in modo forward-compatible il mapping `battery_status_N` per trace per-canale;
+- lo schema live-cache passa alla versione 6 per evitare metadati canale obsoleti precedenti alla v2.9.
+
+Il mapping WeeWX standard dei termoigrometri rimane invariato: CH1 corrisponde a `outTemp` / `outHumidity`, CH2 a `extraTemp1` / `extraHumid1`, CH3 a `extraTemp2` / `extraHumid2`, fino a CH8. I canali WMR200 CH9 e CH10 restano visibili a fini diagnostici tramite campi generici quando non sono mappati esplicitamente dallo schema WeeWX.
 
 Il codice di previsione WMR100/WMR88 viene trasmesso dalla console. La dashboard **non calcola** la previsione dalla pressione o dal trend barometrico.
 
@@ -81,7 +84,7 @@ Sono gestiti:
 - warning USB/protocollo recenti;
 - pannelli specifici per famiglia.
 
-Il pannello RF/canali viene mostrato per la famiglia WMR100/WMR88 e nascosto per WMR200/WMR200A.
+Il pannello RF/termoigrometri viene mostrato per entrambe le famiglie. WMR100/WMR88 rispetta il limite di canali configurato; WMR200/WMR200A supporta in diagnostica CH0–CH10.
 
 ## Pressione e previsione
 
@@ -99,7 +102,7 @@ La sorgente della previsione viene scelta in questo ordine:
 
 ### WMR200 / WMR200A
 
-Per WMR200 il comportamento rimane invariato: vengono mostrati pressione, `altimeter` e previsione forniti dal developer trace del relativo driver.
+Per WMR200 rimane invariata la gestione di pressione e previsione: vengono mostrati pressione, `altimeter` e previsione forniti dal developer trace del relativo driver.
 
 ## Bundle diagnostico
 
@@ -175,9 +178,9 @@ Il repository include un workflow GitHub Actions leggero che:
 
 - esegue il lint PHP;
 - verifica la coerenza della versione in `index.php`, `README.md`, `README-IT.md` e `CHANGELOG.md`;
-- parte sui push a `main`, sulle pull request verso `main` e manualmente.
+- parte sui push a `main` e `develop`, sulle pull request verso `main` e manualmente.
 
-Per ora il progetto può rimanere su un modello semplice con il solo branch permanente `main`. Non è necessario introdurre `develop` finché gli interventi rimangono occasionali e contenuti.
+Le modifiche di sviluppo vengono preparate su `develop`; dopo la validazione possono essere unite a `main`.
 
 ## Sicurezza
 
